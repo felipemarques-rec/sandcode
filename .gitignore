@@ -1,0 +1,19 @@
+/sandcode
+/dist/
+
+# sandcode runtime state (may contain prompts/diffs — never publish)
+.sandcode/*.db
+.sandcode/*.db-wal
+.sandcode/*.db-shm
+.sandcode/store.db
+.sandcode/work/
+
+# code-review-graph plugin artifacts
+.code-review-graph/
+
+*.test
+.env
+.env.local
+
+# internal design history — not part of the public repo
+docs/superpowers/
