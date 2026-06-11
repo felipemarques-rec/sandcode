@@ -112,3 +112,14 @@ func (m *Manager) InjectIntoDir(_ context.Context, workDir string) error {
 	}
 	return nil
 }
+
+// RemoveFromDir deletes the .mcp.json previously written by InjectIntoDir.
+// Callers invoke it before committing the worktree so the injected config —
+// a runtime artifact, not the agent's work product — never lands in the
+// run's diff/commit/merge. Best-effort: a missing file is not an error.
+func (m *Manager) RemoveFromDir(workDir string) error {
+	if err := os.Remove(filepath.Join(workDir, ".mcp.json")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("mcp: remove %s: %w", filepath.Join(workDir, ".mcp.json"), err)
+	}
+	return nil
+}

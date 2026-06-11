@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/felipemarques-rec/sandcode/internal/agent"
+	"github.com/felipemarques-rec/sandcode/internal/approval"
 	"github.com/felipemarques-rec/sandcode/internal/auth"
 	"github.com/felipemarques-rec/sandcode/internal/budget"
 	"github.com/felipemarques-rec/sandcode/internal/event"
@@ -25,6 +26,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/judge"
 	"github.com/felipemarques-rec/sandcode/internal/kernel"
 	"github.com/felipemarques-rec/sandcode/internal/langfuse"
+	"github.com/felipemarques-rec/sandcode/internal/mcp"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 	"github.com/felipemarques-rec/sandcode/internal/store"
@@ -87,11 +89,16 @@ type ExecuteOptions struct {
 	Store          store.Store
 	Bus            event.Bus
 	Refine         RefineOptions
+	LintCmd        []string // Linter Gate command (E1.5b); forwarded to Single/Refine Run path only
+	Reactive       bool     // SP3.2 reactive refine cycle; forwarded to Single/Refine Run path only
 	Governance     *governance.Engine
 	AuditLog       governance.AuditLog
-	Budget         *budget.Guard
-	RunID          string
-	Kernel         *kernel.Kernel
+	// Approver / ApprovalTimeout forward to RunOptions on the Single/Refine path.
+	Approver        approval.Approver
+	ApprovalTimeout time.Duration
+	Budget          *budget.Guard
+	RunID           string
+	Kernel          *kernel.Kernel
 
 	// Langfuse, when non-nil and Enabled(), wraps the whole Execute
 	// (kernel stages + dispatch + dispatched run) in one OTel trace.
@@ -101,6 +108,19 @@ type ExecuteOptions struct {
 	// the Single/Refine dispatch path ONLY. nil ⇒ legacy positional-agent
 	// behavior (byte-identical). NOT forwarded to Parallel or DAG paths.
 	Registry agent.Registry
+
+	// MCP, when non-nil, injects a project-scoped .mcp.json into each run's
+	// worktree (Single, Parallel, and DAG paths). nil ⇒ no injection
+	// (byte-identical legacy).
+	MCP *mcp.Manager
+
+	// Roles, when non-empty, carries the sorted security-role names of the
+	// principal initiating the run; forwarded to RunOptions.Roles and threaded
+	// into the logged governance Action (Action.Roles) so a tool-permission
+	// policy can authorize. Empty ⇒ no principal (CLI/legacy) ⇒ no restriction
+	// (byte-identical). Single/Refine path only — NOT forwarded to Parallel or
+	// DAG paths.
+	Roles []string
 
 	// Single-agent base (used by DispatchSingle/Refine, and as fallback
 	// agent for DAGRun when Agents is empty/single).
@@ -435,6 +455,7 @@ func forwardToParallel(
 		AuditLog:       opts.AuditLog,
 		Budget:         opts.Budget,
 		Refine:         opts.Refine,
+		MCP:            opts.MCP,
 	}
 	subEvents, pAwait, err := ParallelRun(ctx, sb, au, popts)
 	if err != nil {
@@ -494,6 +515,7 @@ func forwardToDAG(
 		Judge:          opts.Judge,
 		Synthesizer:    opts.Synthesizer,
 		Agents:         opts.Agents,
+		MCP:            opts.MCP,
 	}
 	dagEvents, dAwait, err := DAGRun(ctx, sb, ag, au, dopts)
 	if err != nil {
@@ -519,25 +541,31 @@ func forwardToDAG(
 // ExecuteOptions → RunOptions for the Single/Refine paths.
 func buildRunOptionsFromExecute(opts ExecuteOptions, prompt string) RunOptions {
 	return RunOptions{
-		Prompt:         prompt,
-		CWD:            opts.CWD,
-		SandboxImage:   opts.SandboxImage,
-		SandboxWorkDir: opts.SandboxWorkDir,
-		Strategy:       opts.Strategy,
-		KeepWorktree:   opts.KeepWorktree,
-		Timeout:        opts.Timeout,
-		Limits:         opts.Limits,
-		Network:        opts.Network,
-		AgentOpts:      opts.AgentOpts,
-		Store:          opts.Store,
-		Kernel:         opts.Kernel, // overwritten to nil by forwardToRun
-		Bus:            opts.Bus,
-		Refine:         opts.Refine,
-		Governance:     opts.Governance,
-		AuditLog:       opts.AuditLog,
-		Budget:         opts.Budget,
-		RunID:          opts.RunID,
-		Langfuse:       opts.Langfuse,
-		Registry:       opts.Registry, // forwarded to Single/Refine path only
+		Prompt:          prompt,
+		CWD:             opts.CWD,
+		SandboxImage:    opts.SandboxImage,
+		SandboxWorkDir:  opts.SandboxWorkDir,
+		Strategy:        opts.Strategy,
+		KeepWorktree:    opts.KeepWorktree,
+		Timeout:         opts.Timeout,
+		Limits:          opts.Limits,
+		Network:         opts.Network,
+		AgentOpts:       opts.AgentOpts,
+		Store:           opts.Store,
+		Kernel:          opts.Kernel, // overwritten to nil by forwardToRun
+		Bus:             opts.Bus,
+		Refine:          opts.Refine,
+		LintCmd:         opts.LintCmd, // forwarded to Single/Refine path only
+		Reactive:        opts.Reactive,
+		Governance:      opts.Governance,
+		AuditLog:        opts.AuditLog,
+		Approver:        opts.Approver,
+		ApprovalTimeout: opts.ApprovalTimeout,
+		Budget:          opts.Budget,
+		RunID:           opts.RunID,
+		Langfuse:        opts.Langfuse,
+		Registry:        opts.Registry, // forwarded to Single/Refine path only
+		MCP:             opts.MCP,
+		Roles:           opts.Roles, // forwarded to Single/Refine path only
 	}
 }

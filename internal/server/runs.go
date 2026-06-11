@@ -65,6 +65,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stage the authenticated identity server-side. The principal comes from
+	// the request context (injected by withAuth), NEVER from the body — a
+	// client must not name its own roles. Absent (legacy/no-auth) ⇒ zero
+	// Principal ⇒ empty roles ⇒ byte-identical.
+	if p, ok := principalFrom(r.Context()); ok {
+		req.Principal = p
+	}
+
 	runID := orchestrator.NewRunID()
 
 	if s.sched != nil {

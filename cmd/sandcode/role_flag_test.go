@@ -170,7 +170,8 @@ func TestBuildRoleRegistry_MalformedEmptyAgent(t *testing.T) {
 	}
 }
 
-// TestBuildRoleRegistry_AllValidRoles verifies all 7 known roles are accepted.
+// TestBuildRoleRegistry_AllValidRoles verifies all 9 known roles are accepted,
+// including the diagram's Performance Reviewer / Refactoring Specialist (E1.4b).
 func TestBuildRoleRegistry_AllValidRoles(t *testing.T) {
 	allRoles := []string{
 		"planner=claude",
@@ -179,11 +180,13 @@ func TestBuildRoleRegistry_AllValidRoles(t *testing.T) {
 		"verifier=cursor",
 		"reviewer=claude",
 		"security_reviewer=claude",
+		"performance_reviewer=claude",
+		"refactoring_specialist=claude",
 		"reporter=claude",
 	}
 	reg, err := buildRoleRegistry(allRoles)
 	if err != nil {
-		t.Fatalf("all 7 valid roles should register without error: %v", err)
+		t.Fatalf("all 9 valid roles should register without error: %v", err)
 	}
 	if reg == nil {
 		t.Fatal("expected non-nil registry")

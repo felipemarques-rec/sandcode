@@ -57,6 +57,12 @@ const (
 	// PhaseLinting means the linter gate is running (Stage 2).
 	PhaseLinting Phase = "linting"
 
+	// PhaseAwaitingApproval is entered when a governance Review verdict at the
+	// pre-run gate blocks the run pending an approve/reject decision (E2.3).
+	// Non-terminal: an approval returns to submitted; a reject/timeout (via
+	// run.failed) → failed; cancellation → cancelled.
+	PhaseAwaitingApproval Phase = "awaiting_approval"
+
 	// PhaseReporting means REPORT.md generation is in progress (Stage 2).
 	PhaseReporting Phase = "reporting"
 

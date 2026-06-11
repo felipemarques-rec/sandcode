@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/felipemarques-rec/sandcode/internal/rbac"
 )
 
 // RunRequest is the JSON body of POST /v1/runs.
@@ -49,6 +51,12 @@ type RunRequest struct {
 	// Empty => normal. Ignored entirely when the scheduler is disabled.
 	// Additive — pre-existing clients omitting it are unaffected.
 	Priority string `json:"priority,omitempty"`
+
+	// Principal is the authenticated identity that created the run, set
+	// server-side from the request context (NEVER decoded from the body — the
+	// json:"-" tag guarantees a client cannot inject roles). Zero value ⇒ no
+	// principal (legacy/no-auth) ⇒ empty roles ⇒ byte-identical.
+	Principal rbac.Principal `json:"-"`
 }
 
 // Validate returns the first reason the request would be rejected,

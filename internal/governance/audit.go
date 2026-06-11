@@ -158,6 +158,21 @@ func (a *SQLiteAuditLog) ListByRun(ctx context.Context, runID string) ([]AuditRo
 	return out, nil
 }
 
+// LogApproval records that a Review verdict was granted. It appends a single
+// audit row with Result=Approved and the approver id. ID and CreatedAt are
+// filled by Append. Returns nil when log is nil.
+func LogApproval(ctx context.Context, log AuditLog, runID string, action ActionType, approver string) error {
+	if log == nil {
+		return nil
+	}
+	return log.Append(ctx, AuditRow{
+		RunID:      runID,
+		ActionType: action,
+		Result:     Approved,
+		Approver:   approver,
+	})
+}
+
 // LogDecision is a convenience helper that converts a Decision into an
 // aggregate audit row + per-policy detail rows, and appends all of them.
 // Idempotent failure handling: if the first append fails, the rest are

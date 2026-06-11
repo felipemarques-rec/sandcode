@@ -11,6 +11,9 @@
 # code-review-graph plugin artifacts
 .code-review-graph/
 
+# playwright-mcp tool artifacts
+.playwright-mcp/
+
 *.test
 .env
 .env.local

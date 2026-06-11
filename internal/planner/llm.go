@@ -88,6 +88,8 @@ Decomposition rules:
 
 6. ROLES: leave empty unless the task obviously calls for a non-default role (e.g. "reviewer" for an explicit review step).
 
+7. DEFINITION OF DONE (dod): for each node, state a concrete, checkable acceptance criterion — how an engineer would know the node is truly complete (e.g. "go test ./... passes", "the CLI prints the new flag in --help", "the migration applies cleanly"). Keep it one sentence, objective, and verifiable. Omit only when the prompt is already its own unambiguous acceptance criterion.
+
 Return your plan via the decompose tool. Be conservative — when in doubt, emit a single root node.`
 
 var decomposeTool = map[string]any{
@@ -114,6 +116,10 @@ var decomposeTool = map[string]any{
 						"role": map[string]any{
 							"type":        "string",
 							"description": "Optional agent role (implementer, reviewer, etc).",
+						},
+						"dod": map[string]any{
+							"type":        "string",
+							"description": "Definition of Done: a concrete, checkable acceptance criterion for this node (e.g. \"go test ./... passes and the new endpoint returns 200\"). Optional but recommended.",
 						},
 						"depends_on": map[string]any{
 							"type":        "array",

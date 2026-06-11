@@ -107,6 +107,29 @@ func runChain(
 		ChainID: spec.ChainID, RootNodeID: spec.RootNodeID, NodeIDs: nodeIDs(spec.Nodes),
 	})
 
+	// 1b. Inject MCP server configs into the chain worktree so MCP-aware
+	// agents auto-discover them. The DAG path never commits/merges to the
+	// user's repo (it only tracks worktree paths + a winner), so no removal
+	// is needed — the .mcp.json is a harmless runtime artifact in the worktree.
+	if opts.MCP != nil {
+		if enabled := opts.MCP.ListEnabled(ctx); len(enabled) > 0 {
+			if err := opts.MCP.InjectIntoDir(ctx, wt.Path); err != nil {
+				res.Success = false
+				res.FailedAt = spec.RootNodeID
+				res.Finished = time.Now()
+				emitDAG(opts.Bus, event.DAGChainCompleted, opts.RunID, chainCompletedPayload{
+					ChainID: spec.ChainID, Success: false, FailedAt: spec.RootNodeID,
+				})
+				return res, fmt.Errorf("chain %s mcp inject: %w", spec.ChainID, err)
+			}
+			names := make([]string, len(enabled))
+			for i, c := range enabled {
+				names[i] = c.Name
+			}
+			emitDAG(opts.Bus, event.MCPInjected, opts.RunID, mcpInjectedPayload{RunID: opts.RunID, Servers: names})
+		}
+	}
+
 	// 2. One sandbox per chain — reused across nodes. Cheaper than
 	// per-node sandbox; matches the chain's shared-worktree topology.
 	sandboxSpec := sandbox.SandboxSpec{

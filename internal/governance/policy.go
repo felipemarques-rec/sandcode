@@ -33,6 +33,10 @@ const (
 	Allow  Result = "allow"
 	Deny   Result = "deny"
 	Review Result = "review"
+
+	// Approved is an audit-only result recorded when a Review verdict is
+	// granted by an approver. Engine.Evaluate never returns it.
+	Approved Result = "approved"
 )
 
 // ActionType classifies what the orchestrator is asking the engine to
@@ -80,6 +84,15 @@ type Action struct {
 	// Attempt is the current/upcoming attempt number (1-indexed). For
 	// ActionRefine, this is the attempt about to start.
 	Attempt int
+
+	// Tool, when non-empty, names the MCP tool/server this action would grant or
+	// invoke. Empty ⇒ tool-permission policies do not apply.
+	Tool string
+	// Roles is the sorted, deterministic set of security-role names of the
+	// principal that initiated the action. Empty ⇒ no principal (CLI/legacy) ⇒
+	// no restriction. Stored in the audit Action so replay is deterministic —
+	// the policy reads NO ambient identity.
+	Roles []string
 }
 
 // Policy is the interface every concrete rule implements. Evaluate

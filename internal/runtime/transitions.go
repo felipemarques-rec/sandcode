@@ -50,17 +50,32 @@ var transitionTable = map[transition]Phase{
 	// either blesses the run (verify.passed → back to agent_completed) or
 	// triggers a refine attempt (verify.failed → refining → executing).
 	//
-	// PhaseLinting / PhaseReporting / PhaseLearning are reserved for when
-	// their driving events (lint.passed, report.generated, learn.completed)
-	// ship — they are intentionally absent from the table now to keep the
-	// closed-set property honest.
+	// PhaseReporting / PhaseLearning remain reserved for when their driving
+	// events (report.generated is observation-only today; learn.completed)
+	// ship — intentionally absent to keep the closed-set property honest.
 	{From: PhaseAgentCompleted, Event: event.VerifyStarted}: PhaseVerifying,
 	{From: PhaseVerifying, Event: event.VerifyPassed}:       PhaseAgentCompleted,
 	{From: PhaseVerifying, Event: event.VerifyFailed}:       PhaseRefining,
 	{From: PhaseRefining, Event: event.RefineTriggered}:     PhaseExecuting, // Apply bumps Attempt
 
+	// Linter Gate sub-cycle (E1.5b). The lint gate runs after a passing
+	// verify (from agent_completed). A passing lint returns to agent_completed
+	// for finalization; a failing lint triggers a refine attempt, sharing the
+	// refining → executing edge with the verify path.
+	{From: PhaseAgentCompleted, Event: event.LintStarted}: PhaseLinting,
+	{From: PhaseLinting, Event: event.LintPassed}:         PhaseAgentCompleted,
+	{From: PhaseLinting, Event: event.LintFailed}:         PhaseRefining,
+
 	// Terminal finalization: run.completed from agent_completed closes the run.
 	{From: PhaseAgentCompleted, Event: event.RunCompleted}: PhaseCompleted,
+
+	// Approval gate (E2.3): a Review verdict at the pre-run gate parks the run
+	// in awaiting_approval. Approval resumes the normal flow (back to
+	// submitted); reject/timeout surface as run.failed; cancel as run.cancelled.
+	{From: PhaseSubmitted, Event: event.GovernanceApprovalRequired}: PhaseAwaitingApproval,
+	{From: PhaseAwaitingApproval, Event: event.GovernanceApproved}:  PhaseSubmitted,
+	{From: PhaseAwaitingApproval, Event: event.RunFailed}:           PhaseFailed,
+	{From: PhaseAwaitingApproval, Event: event.RunCancelled}:        PhaseCancelled,
 
 	// Cancellation is valid from any non-terminal phase. Listed explicitly
 	// rather than wildcarded so the table stays exhaustive and greppable.
@@ -72,6 +87,7 @@ var transitionTable = map[transition]Phase{
 	{From: PhaseExecuting, Event: event.RunCancelled}:      PhaseCancelled,
 	{From: PhaseAgentCompleted, Event: event.RunCancelled}: PhaseCancelled,
 	{From: PhaseVerifying, Event: event.RunCancelled}:      PhaseCancelled,
+	{From: PhaseLinting, Event: event.RunCancelled}:        PhaseCancelled,
 	{From: PhaseRefining, Event: event.RunCancelled}:       PhaseCancelled,
 
 	// Failure can fire from any non-terminal phase. Same rationale as above —
@@ -84,6 +100,7 @@ var transitionTable = map[transition]Phase{
 	{From: PhaseExecuting, Event: event.RunFailed}:      PhaseFailed,
 	{From: PhaseAgentCompleted, Event: event.RunFailed}: PhaseFailed,
 	{From: PhaseVerifying, Event: event.RunFailed}:      PhaseFailed,
+	{From: PhaseLinting, Event: event.RunFailed}:        PhaseFailed,
 	{From: PhaseRefining, Event: event.RunFailed}:       PhaseFailed,
 }
 
@@ -116,8 +133,6 @@ func IsObservationOnly(typ event.Type) bool {
 		event.AgentToolCalled,
 		event.BrainLessonRecalled,
 		event.BrainLessonExtracted, // fires post-completion via Kernel.Learn
-		event.GovernanceApprovalRequired,
-		event.GovernanceApproved,
 		event.GovernanceDenied,
 		event.BudgetThresholdReached,
 		event.BudgetExceeded,
@@ -137,7 +152,15 @@ func IsObservationOnly(typ event.Type) bool {
 		event.RunArchitected,
 		event.SecurityReviewed,
 		event.PerformanceReviewed,
-		event.RefactoringReviewed:
+		event.RefactoringReviewed,
+		event.ClassifyRequested,
+		event.ArchitectRequested,
+		event.PlanRequested,
+		event.StrategyRequested,
+		event.EnrichRequested,
+		event.ExecuteRequested,
+		event.VerifyRequested,
+		event.LintRequested:
 		return true
 	default:
 		return false

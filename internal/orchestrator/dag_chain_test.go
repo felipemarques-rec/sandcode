@@ -9,6 +9,7 @@ import (
 
 	"github.com/felipemarques-rec/sandcode/internal/agent"
 	"github.com/felipemarques-rec/sandcode/internal/event"
+	"github.com/felipemarques-rec/sandcode/internal/mcp"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 )
@@ -234,6 +235,44 @@ func TestRunChain_KeepWorktreePreservesOnSuccess(t *testing.T) {
 	}
 	if err := statFile(res.Worktree); err != nil {
 		t.Errorf("worktree should be preserved with KeepWorktree=true: %v", err)
+	}
+}
+
+// TestRunChain_MCPInjected verifies a configured MCP manager writes .mcp.json
+// into the chain worktree (visible to the agent) and emits mcp.injected.
+func TestRunChain_MCPInjected(t *testing.T) {
+	h := newChainHarness(t, RefineOptions{})
+	h.opts.KeepWorktree = true
+	mgr := mcp.NewManager(mcp.DefaultConfigs())
+	mgr.Enable("context7")
+	h.opts.MCP = mgr
+	ctx := context.Background()
+
+	plan := []planner.Node{{ID: "a", Prompt: "x"}}
+	res, err := runChain(ctx,
+		sandbox.NewNoSandboxProvider(),
+		&fakeAgent{script: `if [ -f .mcp.json ]; then echo present > saw.txt; else echo absent > saw.txt; fi`},
+		&noopAuth{},
+		chainSpec{ChainID: "chain-0", RootNodeID: "a", Nodes: plan},
+		h.opts,
+	)
+	if err != nil {
+		t.Fatalf("runChain: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("chain should succeed")
+	}
+	// .mcp.json present in the chain worktree.
+	if _, err := os.Stat(filepath.Join(res.Worktree, ".mcp.json")); err != nil {
+		t.Fatalf(".mcp.json missing from chain worktree: %v", err)
+	}
+	// Agent saw it.
+	saw, _ := os.ReadFile(filepath.Join(res.Worktree, "saw.txt"))
+	if string(saw) == "" {
+		t.Fatal("agent marker not written")
+	}
+	if n := h.rec.count(event.MCPInjected); n != 1 {
+		t.Fatalf("mcp.injected count = %d, want 1", n)
 	}
 }
 

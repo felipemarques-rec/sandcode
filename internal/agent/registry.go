@@ -16,7 +16,13 @@ const (
 	RoleVerifier         Role = "verifier"
 	RoleReviewer         Role = "reviewer"
 	RoleSecurityReviewer Role = "security_reviewer"
-	RoleReporter         Role = "reporter"
+	// RolePerformanceReviewer and RoleRefactoringSpecialist mirror the diagram's
+	// Multi-Agent Collaboration roles. They are wired today as judge lenses via
+	// RunOptions (PerformanceReviewer/RefactoringSpecialist); these constants give
+	// them role identity for --role selection and forward-compat parity.
+	RolePerformanceReviewer   Role = "performance_reviewer"
+	RoleRefactoringSpecialist Role = "refactoring_specialist"
+	RoleReporter              Role = "reporter"
 )
 
 // Registry binds named roles to Provider instances. Interface is verbatim

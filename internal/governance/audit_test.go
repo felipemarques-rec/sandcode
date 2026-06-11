@@ -152,3 +152,22 @@ func TestLogDecision_NilLogIsNoOp(t *testing.T) {
 		t.Fatalf("LogDecision(nil) returned error: %v", err)
 	}
 }
+
+func TestLogApproval(t *testing.T) {
+	t.Parallel()
+	a := openTestAudit(t)
+	ctx := context.Background()
+	if err := LogApproval(ctx, a, "run-x", ActionExecute, "alice"); err != nil {
+		t.Fatalf("LogApproval: %v", err)
+	}
+	rows, err := a.ListByRun(ctx, "run-x")
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].Result != Approved || rows[0].Approver != "alice" {
+		t.Fatalf("row = %+v, want Result=approved Approver=alice", rows[0])
+	}
+}

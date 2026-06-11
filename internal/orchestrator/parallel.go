@@ -19,6 +19,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/kernel"
 	"github.com/felipemarques-rec/sandcode/internal/langfuse"
 	sclog "github.com/felipemarques-rec/sandcode/internal/log"
+	"github.com/felipemarques-rec/sandcode/internal/mcp"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 	"github.com/felipemarques-rec/sandcode/internal/store"
 	"github.com/google/uuid"
@@ -107,6 +108,10 @@ type ParallelOptions struct {
 
 	// Langfuse, when non-nil, provides OTel instrumentation for LLM observability.
 	Langfuse *langfuse.Provider
+
+	// MCP, when non-nil, is forwarded to each child Run so every sub-worktree
+	// gets a .mcp.json. nil ⇒ no injection (byte-identical legacy).
+	MCP *mcp.Manager
 }
 
 // SubResult is the outcome of one fan-out branch.
@@ -224,6 +229,7 @@ func ParallelRun(
 				AuditLog:       opts.AuditLog,
 				Budget:         opts.Budget,
 				Refine:         opts.Refine,
+				MCP:            opts.MCP,
 			}
 			runOpts.AgentOpts.WorkDir = filepath.Join(opts.SandboxWorkDir)
 

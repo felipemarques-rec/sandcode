@@ -67,18 +67,38 @@ func TestLookupTransition_RefineLoop(t *testing.T) {
 	}
 }
 
+// TestLookupTransition_LintGate verifies the Linter Gate sub-cycle (E1.5b):
+// agent_completed → linting on lint.started, linting → agent_completed on
+// lint.passed, and linting → refining on lint.failed (sharing the
+// refining → executing edge with the verify path).
+func TestLookupTransition_LintGate(t *testing.T) {
+	t.Parallel()
+
+	if next, err := LookupTransition(PhaseAgentCompleted, event.LintStarted); err != nil || next != PhaseLinting {
+		t.Fatalf("agent_completed+lint.started: got=%s err=%v want=linting", next, err)
+	}
+	if next, err := LookupTransition(PhaseLinting, event.LintPassed); err != nil || next != PhaseAgentCompleted {
+		t.Fatalf("linting+lint.passed: got=%s err=%v want=agent_completed", next, err)
+	}
+	if next, err := LookupTransition(PhaseLinting, event.LintFailed); err != nil || next != PhaseRefining {
+		t.Fatalf("linting+lint.failed: got=%s err=%v want=refining", next, err)
+	}
+	if next, err := LookupTransition(PhaseRefining, event.RefineTriggered); err != nil || next != PhaseExecuting {
+		t.Fatalf("refining+refine.triggered: got=%s err=%v want=executing", next, err)
+	}
+}
+
 // TestLookupTransition_FailFromAnyPhase asserts run.failed is permitted
-// from every non-terminal phase reachable today. PhaseLinting/Reporting/
-// Learning are reserved enums (Stage-2 refine ships their drivers) — not
-// listed here until they are reachable, so the closed-set property stays
-// honest.
+// from every non-terminal phase reachable today. PhaseReporting/Learning
+// remain reserved enums (their drivers are observation-only / unshipped) —
+// not listed here until reachable, so the closed-set property stays honest.
 func TestLookupTransition_FailFromAnyPhase(t *testing.T) {
 	t.Parallel()
 
 	for _, p := range []Phase{
 		PhaseSubmitted, PhaseClassified, PhasePlanned, PhaseEnriched,
 		PhaseSandboxReady, PhaseExecuting, PhaseAgentCompleted,
-		PhaseVerifying, PhaseRefining,
+		PhaseVerifying, PhaseLinting, PhaseRefining,
 	} {
 		next, err := LookupTransition(p, event.RunFailed)
 		if err != nil {
@@ -126,8 +146,9 @@ func TestIsObservationOnly_StableContract(t *testing.T) {
 		event.AgentToolCalled,
 		event.BrainLessonRecalled,
 		event.BrainLessonExtracted,
-		event.GovernanceApprovalRequired,
-		event.GovernanceApproved,
+		// GovernanceApprovalRequired and GovernanceApproved are no longer
+		// observation-only — they now drive transitions (E2.3 approval gate).
+		// Only GovernanceDenied remains purely observational.
 		event.GovernanceDenied,
 		event.BudgetThresholdReached,
 		event.BudgetExceeded,
@@ -148,6 +169,14 @@ func TestIsObservationOnly_StableContract(t *testing.T) {
 		event.SecurityReviewed,
 		event.PerformanceReviewed,
 		event.RefactoringReviewed,
+		event.ClassifyRequested,
+		event.ArchitectRequested,
+		event.PlanRequested,
+		event.StrategyRequested,
+		event.EnrichRequested,
+		event.ExecuteRequested,
+		event.VerifyRequested,
+		event.LintRequested,
 	}
 	for _, e := range mustBe {
 		if !IsObservationOnly(e) {
@@ -181,5 +210,42 @@ func TestPhase_IsTerminal(t *testing.T) {
 		if p.IsTerminal() {
 			t.Fatalf("%s should NOT be terminal", p)
 		}
+	}
+}
+
+func TestTransition_ApprovalFlow(t *testing.T) {
+	next, err := LookupTransition(PhaseSubmitted, event.GovernanceApprovalRequired)
+	if err != nil || next != PhaseAwaitingApproval {
+		t.Fatalf("submitted+approval_required → %v,%v; want awaiting_approval", next, err)
+	}
+	next, err = LookupTransition(PhaseAwaitingApproval, event.GovernanceApproved)
+	if err != nil || next != PhaseSubmitted {
+		t.Fatalf("awaiting+approved → %v,%v; want submitted", next, err)
+	}
+	next, err = LookupTransition(PhaseAwaitingApproval, event.RunFailed)
+	if err != nil || next != PhaseFailed {
+		t.Fatalf("awaiting+failed → %v,%v; want failed", next, err)
+	}
+	next, err = LookupTransition(PhaseAwaitingApproval, event.RunCancelled)
+	if err != nil || next != PhaseCancelled {
+		t.Fatalf("awaiting+cancelled → %v,%v; want cancelled", next, err)
+	}
+}
+
+func TestAwaitingApprovalNotTerminal(t *testing.T) {
+	if PhaseAwaitingApproval.IsTerminal() {
+		t.Fatal("awaiting_approval must not be terminal")
+	}
+}
+
+func TestObservationContract_ApprovalEventsDrive(t *testing.T) {
+	if IsObservationOnly(event.GovernanceApprovalRequired) {
+		t.Fatal("GovernanceApprovalRequired must no longer be observation-only")
+	}
+	if IsObservationOnly(event.GovernanceApproved) {
+		t.Fatal("GovernanceApproved must no longer be observation-only")
+	}
+	if !IsObservationOnly(event.GovernanceDenied) {
+		t.Fatal("GovernanceDenied must remain observation-only")
 	}
 }

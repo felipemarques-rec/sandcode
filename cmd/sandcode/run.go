@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/felipemarques-rec/sandcode/internal/agent"
+	"github.com/felipemarques-rec/sandcode/internal/approval"
 	"github.com/felipemarques-rec/sandcode/internal/architect"
 	"github.com/felipemarques-rec/sandcode/internal/auth"
 	"github.com/felipemarques-rec/sandcode/internal/brain"
@@ -22,11 +23,13 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/judge"
 	"github.com/felipemarques-rec/sandcode/internal/kernel"
 	"github.com/felipemarques-rec/sandcode/internal/langfuse"
+	"github.com/felipemarques-rec/sandcode/internal/mcp"
 	"github.com/felipemarques-rec/sandcode/internal/orchestrator"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 	"github.com/felipemarques-rec/sandcode/internal/secreview"
 	"github.com/felipemarques-rec/sandcode/internal/store"
+	strat "github.com/felipemarques-rec/sandcode/internal/strategy"
 	"github.com/spf13/cobra"
 )
 
@@ -53,7 +56,11 @@ type runFlags struct {
 	llmAuth      string
 	learn        bool
 	architect    bool
+	planStage    bool // --plan: wire kernel planner (decompose high-complexity prompts)
+	strategySel  bool // --strategy-select: wire kernel selector (pick single/refine/parallel)
+	reactive     bool // --reactive: route classify through the deterministic reactor (SP3.0)
 	roles        []string
+	mcp          []string // --mcp: MCP servers to enable (e.g. context7)
 
 	// DAG mode (W12 Slice 4).
 	dag         bool
@@ -69,6 +76,8 @@ type runFlags struct {
 
 	perfReview     bool
 	refactorReview bool
+
+	approvalTimeout time.Duration
 
 	gateFlags
 }
@@ -104,13 +113,15 @@ func resolveAgent(name string) (agent.Provider, error) {
 
 // validRoles is the known-role set for --role flag validation.
 var validRoles = map[string]struct{}{
-	string(agent.RolePlanner):          {},
-	string(agent.RoleArchitect):        {},
-	string(agent.RoleImplementer):      {},
-	string(agent.RoleVerifier):         {},
-	string(agent.RoleReviewer):         {},
-	string(agent.RoleSecurityReviewer): {},
-	string(agent.RoleReporter):         {},
+	string(agent.RolePlanner):               {},
+	string(agent.RoleArchitect):             {},
+	string(agent.RoleImplementer):           {},
+	string(agent.RoleVerifier):              {},
+	string(agent.RoleReviewer):              {},
+	string(agent.RoleSecurityReviewer):      {},
+	string(agent.RolePerformanceReviewer):   {},
+	string(agent.RoleRefactoringSpecialist): {},
+	string(agent.RoleReporter):              {},
 }
 
 // buildRoleRegistry parses a slice of "role=agent" spec strings (from
@@ -138,7 +149,7 @@ func buildRoleRegistry(specs []string) (agent.Registry, error) {
 			return nil, fmt.Errorf("invalid --role %q (want role=agent)", spec)
 		}
 		if _, ok := validRoles[roleTok]; !ok {
-			return nil, fmt.Errorf("unknown role %q (valid: planner, architect, implementer, verifier, reviewer, security_reviewer, reporter)", roleTok)
+			return nil, fmt.Errorf("unknown role %q (valid: planner, architect, implementer, verifier, reviewer, security_reviewer, performance_reviewer, refactoring_specialist, reporter)", roleTok)
 		}
 		p, err := resolveAgent(agentTok)
 		if err != nil {
@@ -152,6 +163,57 @@ func buildRoleRegistry(specs []string) (agent.Registry, error) {
 		}
 	}
 	return reg, nil
+}
+
+// buildMCPManager builds an MCP manager from the --mcp server names, enabling
+// each requested server out of the built-in DefaultConfigs. An empty slice
+// returns (nil, nil) so the orchestrator keeps the byte-identical legacy path.
+// An unknown server name is a hard error before any worktree/sandbox spin-up.
+func buildMCPManager(names []string) (*mcp.Manager, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	m := mcp.NewManager(mcp.DefaultConfigs())
+	for _, n := range names {
+		if !m.Enable(strings.TrimSpace(n)) {
+			return nil, fmt.Errorf("unknown --mcp server %q (valid: context7, claude-mem)", n)
+		}
+	}
+	return m, nil
+}
+
+// mcpExtraArgs returns the claude-specific flags that make the injected
+// .mcp.json usable headlessly: it scopes config to the injected file
+// (--strict-mcp-config --mcp-config) and auto-allows each enabled server's
+// tools (--allowedTools "mcp__<server> …"), least-privilege. Returns nil for a
+// non-Claude agent or an empty manager — those get the file only (or nothing).
+//
+// permitted, when non-nil, gates each enabled server by name (RBAC); a server
+// is allow-listed only if permitted(server.Name) is true. A nil filter permits
+// every enabled server (byte-identical to the unfiltered behavior). When the
+// filter rejects every server the result is nil, just like an empty manager.
+func mcpExtraArgs(m *mcp.Manager, ag agent.Provider, permitted func(tool string) bool) []string {
+	if m == nil || ag == nil || ag.Name() != "claude-code" {
+		return nil
+	}
+	enabled := m.ListEnabled(context.Background())
+	if len(enabled) == 0 {
+		return nil
+	}
+	allow := make([]string, 0, len(enabled))
+	for _, c := range enabled {
+		if permitted == nil || permitted(c.Name) {
+			allow = append(allow, "mcp__"+c.Name)
+		}
+	}
+	if len(allow) == 0 {
+		return nil
+	}
+	return []string{
+		"--strict-mcp-config",
+		"--mcp-config", ".mcp.json",
+		"--allowedTools", strings.Join(allow, " "),
+	}
 }
 
 // LLM auth transport modes for the Go-side LLM features.
@@ -284,6 +346,15 @@ func newRunCmd() *cobra.Command {
 			if f.architect && !f.learn {
 				return errors.New("--architect requires --learn (kernel path)")
 			}
+			if f.planStage && !f.learn {
+				return errors.New("--plan requires --learn (kernel path)")
+			}
+			if f.strategySel && !f.learn {
+				return errors.New("--strategy-select requires --learn (kernel path)")
+			}
+			if f.reactive && !f.learn {
+				return errors.New("--reactive requires --learn (kernel path)")
+			}
 
 			cwd := f.cwd
 			if cwd == "" {
@@ -411,12 +482,42 @@ func newRunCmd() *cobra.Command {
 					}
 					kopts = append(kopts, kernel.WithArchitect(arch))
 				}
+				// Wire the kernel planner when the user opts into the Plan
+				// stage (--plan) or the DAG path (--dag relies on
+				// kn.ForcePlan). Without either, the planner stays nil and
+				// the Plan stage is skipped (byte-identical legacy).
+				if f.planStage || f.dag {
+					pl, perr := newPlanner(f)
+					if perr != nil {
+						return perr
+					}
+					kopts = append(kopts, kernel.WithPlanner(pl))
+				}
+				// Wire the deterministic strategy selector when the user
+				// opts into kernel-decided dispatch (--strategy-select).
+				// nil selector ⇒ empty Strategy ⇒ Execute defaults to single.
+				if f.strategySel {
+					kopts = append(kopts, kernel.WithSelector(strat.New()))
+				}
+				// Wire the deterministic reactor for the classify stage (SP3.0
+				// PoC). Needs the bus (already wired above). Off ⇒ direct path.
+				if f.reactive {
+					kopts = append(kopts, kernel.WithReactive())
+				}
 				kn = kernel.New(br, kopts...)
 			}
 
 			engine, guard, refineOpts, err := buildGates(f.gateFlags)
 			if err != nil {
 				return err
+			}
+
+			// When governance is configured, a Review verdict may pause the
+			// run pending human approval; the terminal approver prompts on
+			// stdin/stderr. nil approver ⇒ byte-identical legacy path.
+			var approver approval.Approver
+			if engine != nil {
+				approver = &approval.TerminalApprover{In: os.Stdin, Out: os.Stderr}
 			}
 
 			// Build role registry from --role flags (single-agent paths only).
@@ -443,31 +544,46 @@ func newRunCmd() *cobra.Command {
 
 			ag := agents[0]
 
+			// MCP wiring: build the manager from --mcp (validates names) and
+			// the claude-specific ExtraArgs that make the injected .mcp.json
+			// usable headlessly. nil manager ⇒ byte-identical legacy.
+			mcpMgr, err := buildMCPManager(f.mcp)
+			if err != nil {
+				return err
+			}
+			agentOpts := agent.RunOptions{Model: f.model}
+			agentOpts.ExtraArgs = mcpExtraArgs(mcpMgr, ag, nil)
+
 			// When the kernel is configured (--learn), route through
 			// orchestrator.Execute so kernel-decided dispatch happens.
 			// kn == nil → fall through to direct orchestrator.Run, no
 			// behavioral change.
 			if kn != nil {
 				eopts := orchestrator.ExecuteOptions{
-					Prompt:         prompt,
-					CWD:            cwd,
-					SandboxImage:   f.image,
-					SandboxWorkDir: f.workdir,
-					Strategy:       strategy,
-					KeepWorktree:   f.keepWorktree,
-					Timeout:        f.timeout,
-					Network:        f.network,
-					Limits:         limits,
-					AgentOpts:      agent.RunOptions{Model: f.model},
-					Store:          st,
-					Kernel:         kn,
-					Bus:            bus,
-					Langfuse:       lf,
-					Governance:     engine,
-					Budget:         guard,
-					Refine:         refineOpts,
-					Agent:          ag,
-					Registry:       reg,
+					Prompt:          prompt,
+					CWD:             cwd,
+					SandboxImage:    f.image,
+					SandboxWorkDir:  f.workdir,
+					Strategy:        strategy,
+					KeepWorktree:    f.keepWorktree,
+					Timeout:         f.timeout,
+					Network:         f.network,
+					Limits:          limits,
+					AgentOpts:       agentOpts,
+					Store:           st,
+					Kernel:          kn,
+					Bus:             bus,
+					Langfuse:        lf,
+					Governance:      engine,
+					Approver:        approver,
+					ApprovalTimeout: f.approvalTimeout,
+					Budget:          guard,
+					Refine:          refineOpts,
+					LintCmd:         f.lintCmd,
+					Reactive:        f.reactive,
+					Agent:           ag,
+					Registry:        reg,
+					MCP:             mcpMgr,
 				}
 				fmt.Printf("\033[1;36m[sandcode]\033[0m running %s on %s (auto-dispatch) — prompt: %q\n", ag.Name(), sb.Name(), truncate(prompt, 80))
 				events, await, err := orchestrator.Execute(ctx, sb, au, eopts)
@@ -507,25 +623,30 @@ func newRunCmd() *cobra.Command {
 			}
 
 			runOpts := orchestrator.RunOptions{
-				Prompt:         prompt,
-				CWD:            cwd,
-				SandboxImage:   f.image,
-				SandboxWorkDir: f.workdir,
-				Strategy:       strategy,
-				KeepWorktree:   f.keepWorktree,
-				Timeout:        f.timeout,
-				Network:        f.network,
-				Limits:         limits,
-				AgentOpts:      agent.RunOptions{Model: f.model},
-				Store:          st,
-				Brain:          br,
-				Kernel:         kn,
-				Bus:            bus,
-				Langfuse:       lf,
-				Governance:     engine,
-				Budget:         guard,
-				Refine:         refineOpts,
-				Registry:       reg,
+				Prompt:          prompt,
+				CWD:             cwd,
+				SandboxImage:    f.image,
+				SandboxWorkDir:  f.workdir,
+				Strategy:        strategy,
+				KeepWorktree:    f.keepWorktree,
+				Timeout:         f.timeout,
+				Network:         f.network,
+				Limits:          limits,
+				AgentOpts:       agentOpts,
+				Store:           st,
+				Brain:           br,
+				Kernel:          kn,
+				Bus:             bus,
+				Langfuse:        lf,
+				Governance:      engine,
+				Approver:        approver,
+				ApprovalTimeout: f.approvalTimeout,
+				Budget:          guard,
+				Refine:          refineOpts,
+				LintCmd:         f.lintCmd,
+				Reactive:        f.reactive,
+				Registry:        reg,
+				MCP:             mcpMgr,
 			}
 
 			fmt.Printf("\033[1;36m[sandcode]\033[0m running %s on %s — prompt: %q\n", ag.Name(), sb.Name(), truncate(prompt, 80))
@@ -661,6 +782,12 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.learn, "learn", false, "enable cognitive learning: enrich prompts with past lessons and learn from outcomes")
 	cmd.Flags().BoolVar(&f.architect, "architect", false,
 		"design solution guidance before the run (kernel-stage; needs ANTHROPIC_API_KEY; requires --learn)")
+	cmd.Flags().BoolVar(&f.planStage, "plan", false,
+		"kernel decomposes high-complexity prompts into a TaskDAG (needs ANTHROPIC_API_KEY; requires --learn)")
+	cmd.Flags().BoolVar(&f.strategySel, "strategy-select", false,
+		"kernel picks execution shape single/refine/parallel from classification+plan (requires --learn)")
+	cmd.Flags().BoolVar(&f.reactive, "reactive", false,
+		"drive the run through the deterministic reactor (SP3 bus-mediation): cognitive pipeline (classify→enrich) and the execute/verify/lint/refine cycle. Byte-identical results; requires --learn")
 	cmd.Flags().BoolVar(&f.dag, "dag", false, "execute as multi-node DAG plan; forces planner LLM if Plan empty after kernel. Cost scales as outerN × chains × nodes × refineMaxAttempts; use --max-cost-usd to cap.")
 	cmd.Flags().StringVar(&f.dagFromFile, "dag-from-file", "", "load TaskDAG plan from JSON file (deterministic input, overrides planner output). Requires --dag.")
 	cmd.Flags().BoolVar(&f.report, "report", false,
@@ -676,6 +803,8 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.refactorReview, "refactor-review", false,
 		"LLM refactoring review of the diff after the run (needs ANTHROPIC_API_KEY); adds a ## Refactoring section/event")
 	cmd.Flags().StringArrayVar(&f.roles, "role", nil, "bind a role to an agent: --role role=agent (repeatable; SP1 only acts on implementer)")
+	cmd.Flags().StringSliceVar(&f.mcp, "mcp", nil, "enable MCP servers by name (repeatable): context7|claude-mem")
+	cmd.Flags().DurationVar(&f.approvalTimeout, "approval-timeout", 5*time.Minute, "max wait for a governance Review approval (terminal prompt) before failing the run")
 	registerGateFlags(cmd, &f.gateFlags)
 	return cmd
 }
@@ -727,6 +856,15 @@ func runParallel(
 	fmt.Printf("\033[1;36m[sandcode]\033[0m parallel run on %s — agents=%v strategy=%s judge=%v\n",
 		sb.Name(), names, parStrat, judgeName(jg))
 
+	// MCP wiring (shared across all sub-runs). The claude ExtraArgs key off
+	// agents[0] (the fan-out agents are homogeneous in practice).
+	mcpMgr, err := buildMCPManager(f.mcp)
+	if err != nil {
+		return err
+	}
+	agentOpts := agent.RunOptions{Model: f.model}
+	agentOpts.ExtraArgs = mcpExtraArgs(mcpMgr, agents[0], nil)
+
 	popts := orchestrator.ParallelOptions{
 		Prompt:         prompt,
 		CWD:            cwd,
@@ -739,7 +877,7 @@ func runParallel(
 		Limits:         limits,
 		MaxConcurrency: f.maxConc,
 		Agents:         agents,
-		AgentOpts:      agent.RunOptions{Model: f.model},
+		AgentOpts:      agentOpts,
 		Store:          st,
 		Judge:          jg,
 		Brain:          br,
@@ -748,6 +886,7 @@ func runParallel(
 		Governance:     engine,
 		Budget:         guard,
 		Refine:         refineOpts,
+		MCP:            mcpMgr,
 	}
 
 	events, await, err := orchestrator.ParallelRun(ctx, sb, au, popts)
@@ -909,9 +1048,17 @@ func runDAGCommandWithJudge(
 		return fmt.Errorf("--dag: no agents resolved")
 	}
 	ag := agents[0]
+
+	// MCP wiring (shared across all chains). nil ⇒ byte-identical legacy.
+	mcpMgr, err := buildMCPManager(f.mcp)
+	if err != nil {
+		return err
+	}
+	agentOpts := agent.RunOptions{Model: f.model}
+	agentOpts.ExtraArgs = mcpExtraArgs(mcpMgr, ag, nil)
+
 	// 1. Resolve plan.
 	var plan planner.TaskDAG
-	var err error
 	switch {
 	case f.dagFromFile != "":
 		plan, err = loadDAGFromFile(f.dagFromFile)
@@ -964,7 +1111,7 @@ func runDAGCommandWithJudge(
 		Timeout:        f.timeout,
 		Limits:         limits,
 		Network:        f.network,
-		AgentOpts:      agent.RunOptions{Model: f.model},
+		AgentOpts:      agentOpts,
 		Store:          st,
 		Kernel:         kn,
 		Bus:            bus,
@@ -973,6 +1120,7 @@ func runDAGCommandWithJudge(
 		Budget:         guard,
 		Plan:           plan,
 		Judge:          jud,
+		MCP:            mcpMgr,
 	}
 	if len(agents) > 1 {
 		dagOpts.Agents = agents

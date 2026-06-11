@@ -41,6 +41,42 @@ func TestBuildHandoffPrompt_AppendsStructuredBlock(t *testing.T) {
 	}
 }
 
+func TestBuildHandoffPrompt_AppendsDoD(t *testing.T) {
+	t.Parallel()
+	// First node (no prev): DoD appended after the literal prompt.
+	first := planner.Node{ID: "a", Prompt: "create user model", DoD: "go test ./... passes"}
+	got := buildHandoffPrompt(first, nil)
+	if !strings.Contains(got, "## Definition of done") || !strings.Contains(got, "go test ./... passes") {
+		t.Errorf("first-node DoD missing\nfull: %s", got)
+	}
+	if !strings.HasPrefix(got, "create user model") {
+		t.Errorf("DoD should follow the prompt, got: %q", got)
+	}
+
+	// Subsequent node (with prev): DoD appended after the handoff block.
+	prev := []NodeResult{{NodeID: "a", Prompt: "create user model", Result: AgentInvocationResult{Completion: "done"}}}
+	node := planner.Node{ID: "b", Prompt: "add validation", DoD: "validation rejects empty email"}
+	got = buildHandoffPrompt(node, prev)
+	if !strings.Contains(got, "Previous step (node a)") {
+		t.Errorf("handoff block missing\nfull: %s", got)
+	}
+	if !strings.Contains(got, "## Definition of done") || !strings.Contains(got, "validation rejects empty email") {
+		t.Errorf("subsequent-node DoD missing\nfull: %s", got)
+	}
+}
+
+func TestBuildHandoffPrompt_NoDoD_ByteIdentical(t *testing.T) {
+	t.Parallel()
+	// Empty DoD must leave both paths byte-identical to the legacy output.
+	first := planner.Node{ID: "a", Prompt: "create user model"}
+	if got := buildHandoffPrompt(first, nil); got != "create user model" {
+		t.Errorf("empty DoD changed first-node output: %q", got)
+	}
+	if strings.Contains(buildHandoffPrompt(first, nil), "Definition of done") {
+		t.Error("empty DoD should not emit a Definition-of-done section")
+	}
+}
+
 func TestBuildHandoffPrompt_TruncatesLongCompletion(t *testing.T) {
 	t.Parallel()
 	long := strings.Repeat("x ", 5000)

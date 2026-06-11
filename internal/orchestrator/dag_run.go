@@ -236,6 +236,7 @@ func runSingleNodeDAG(
 		AuditLog:       opts.AuditLog,
 		Budget:         opts.Budget,
 		RunID:          opts.RunID,
+		MCP:            opts.MCP,
 	}
 
 	started := time.Now()

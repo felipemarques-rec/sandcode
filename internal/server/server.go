@@ -12,9 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/felipemarques-rec/sandcode/internal/approval"
 	"github.com/felipemarques-rec/sandcode/internal/event"
 	"github.com/felipemarques-rec/sandcode/internal/governance"
 	"github.com/felipemarques-rec/sandcode/internal/metrics"
+	"github.com/felipemarques-rec/sandcode/internal/ratelimit"
+	"github.com/felipemarques-rec/sandcode/internal/rbac"
 	"github.com/felipemarques-rec/sandcode/internal/scheduler"
 )
 
@@ -47,6 +50,11 @@ type Options struct {
 	// if nil the POST endpoint returns 503.
 	Launcher Launcher
 
+	// Approvals, when non-nil, backs POST /v1/approvals/{id} (E2.3). nil ⇒ the
+	// endpoint returns 503. Shared with the launcher so a blocked run and the
+	// HTTP handler rendezvous on the same registry.
+	Approvals *approval.Registry
+
 	// AllowedCWDRoots constrains the host directories a RunRequest.CWD may
 	// target. When non-empty, req.CWD must equal or be a subpath of one of
 	// these roots (symlinks resolved). When empty, any CWD is accepted —
@@ -60,6 +68,21 @@ type Options struct {
 	// (serve() refuses a non-loopback listener without a token). This gates
 	// the RCE surface (POST /v1/runs) and the data-disclosure reads.
 	AuthToken string
+
+	// Keyring, when non-nil, enables RBAC: every request (except GET /healthz)
+	// must carry "Authorization: Bearer <token>" matching a keyring entry, and
+	// per-route capability gates apply. A configured Keyring SUPERSEDES
+	// AuthToken (the legacy single-token path is ignored). nil ⇒ legacy
+	// single-token path (byte-identical to pre-RBAC behavior).
+	Keyring *rbac.Keyring
+
+	// CORS, when non-nil and with a non-empty allowlist, enables CORS response
+	// headers and preflight handling. nil/empty ⇒ no CORS (byte-identical).
+	CORS *CORSConfig
+
+	// RateLimit, when non-nil, enables per-client-IP token-bucket rate limiting.
+	// nil ⇒ disabled (byte-identical).
+	RateLimit *RateLimitConfig
 
 	// Logger used for request and lifecycle logs. Defaults to slog.Default().
 	Logger *slog.Logger
@@ -98,6 +121,8 @@ type Server struct {
 	// handler is the mux wrapped with the auth middleware. Served by serve()
 	// and returned by Handler(). When AuthToken is empty it is the bare mux.
 	handler http.Handler
+	// limiter backs withRateLimit. nil ⇒ rate limiting disabled. Built once in New.
+	limiter *ratelimit.Limiter
 
 	// inFlight tracks launcher goroutines so shutdown can wait on them.
 	inFlight sync.WaitGroup
@@ -154,16 +179,47 @@ func New(opts Options) *Server {
 	// Pre-initialise launchCtx so that handlers invoked through Handler()
 	// (in tests) have a valid context even when Serve/Run never runs.
 	s.launchCtx, s.launchCancel = context.WithCancel(context.Background())
+	if opts.RateLimit != nil {
+		ttl := opts.RateLimit.TTL
+		if ttl <= 0 {
+			ttl = 10 * time.Minute
+		}
+		s.limiter = ratelimit.New(opts.RateLimit.RequestsPerSecond, opts.RateLimit.Burst, ttl)
+	}
 	s.routes()
-	s.handler = s.withAuth(s.mux)
+	s.handler = s.withCORS(s.withRateLimit(s.withAuth(s.mux)))
 	return s
 }
 
-// withAuth wraps h with bearer-token authentication when Options.AuthToken is
-// set. GET /healthz is always exempt (liveness probes). With no token the bare
-// handler is returned (byte-identical to the pre-auth behavior) — serve()
-// guarantees that only happens on a loopback bind.
+// withAuth wraps h with authentication. It has three branches:
+//
+//  1. Keyring nil && AuthToken == "" — no auth: the bare handler is returned,
+//     byte-identical to the pre-auth behavior. serve() guarantees that only
+//     happens on a loopback bind.
+//  2. Keyring nil && AuthToken != "" — legacy single-token path: the exact
+//     constant-time bearer compare as before, GET /healthz exempt, identical
+//     401 + WWW-Authenticate: Bearer. The ONLY addition is that a SUCCESSFUL
+//     compare injects an admin principal into the request context (capability
+//     gates short-circuit allow; legacy handlers ignore it ⇒ byte-identical).
+//  3. Keyring != nil — RBAC path: GET /healthz exempt, otherwise the
+//     Authorization header is looked up in the keyring; a miss returns the
+//     identical 401, a hit injects the resolved principal into the context.
 func (s *Server) withAuth(h http.Handler) http.Handler {
+	if s.opts.Keyring != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/healthz" {
+				h.ServeHTTP(w, r)
+				return
+			}
+			p, ok := s.opts.Keyring.Lookup(r.Header.Get("Authorization"))
+			if !ok {
+				w.Header().Set("WWW-Authenticate", `Bearer`)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			h.ServeHTTP(w, r.WithContext(withPrincipal(r.Context(), p)))
+		})
+	}
 	if s.opts.AuthToken == "" {
 		return h
 	}
@@ -179,8 +235,32 @@ func (s *Server) withAuth(h http.Handler) http.Handler {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		h.ServeHTTP(w, r)
+		h.ServeHTTP(w, r.WithContext(withPrincipal(r.Context(), rbac.AdminPrincipal())))
 	})
+}
+
+// requireCapability gates next behind the named RBAC capability. When the
+// keyring is nil it short-circuits straight through (byte-identical legacy
+// behavior). Otherwise it reads the principal injected by withAuth: a missing
+// principal is a 401 (defense in depth — withAuth should have rejected first),
+// and a principal whose resolved grant lacks the capability is a 403.
+func (s *Server) requireCapability(capName string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.opts.Keyring == nil {
+			next(w, r)
+			return
+		}
+		p, ok := principalFrom(r.Context())
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "unauthorized"})
+			return
+		}
+		if !s.opts.Keyring.RoleSet().Resolve(p).AllowsCapability(capName) {
+			writeJSON(w, http.StatusForbidden, errorResponse{Error: "forbidden"})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // isLoopbackAddr reports whether a listener address is bound to loopback only.
@@ -304,14 +384,19 @@ func (s *Server) Handler() http.Handler { return s.handler }
 // routes registers every HTTP route. Keep this function the single
 // source of truth so the route table is greppable.
 func (s *Server) routes() {
+	// /healthz and /metrics are never capability-gated (liveness + scrape).
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.Handle("GET /metrics", s.opts.Registry.Handler())
-	s.mux.HandleFunc("POST /v1/runs", s.handleCreateRun)
-	s.mux.HandleFunc("GET /v1/runs", s.handleListRuns)
-	s.mux.HandleFunc("GET /v1/runs/{id}", s.handleGetRun)
-	s.mux.HandleFunc("GET /v1/runs/{id}/events", s.handleRunEventsSSE)
-	s.mux.HandleFunc("GET /v1/runs/{id}/audit", s.handleListRunAudit)
-	s.mux.HandleFunc("DELETE /v1/runs/{id}", s.handleCancelRun)
+	// Per-route RBAC capability gates. requireCapability is a no-op
+	// short-circuit when Options.Keyring is nil, so these wrappers are
+	// byte-identical on the legacy path.
+	s.mux.HandleFunc("POST /v1/runs", s.requireCapability(rbac.CapRunCreate, s.handleCreateRun))
+	s.mux.HandleFunc("GET /v1/runs", s.requireCapability(rbac.CapRunRead, s.handleListRuns))
+	s.mux.HandleFunc("GET /v1/runs/{id}", s.requireCapability(rbac.CapRunRead, s.handleGetRun))
+	s.mux.HandleFunc("GET /v1/runs/{id}/events", s.requireCapability(rbac.CapRunRead, s.handleRunEventsSSE))
+	s.mux.HandleFunc("GET /v1/runs/{id}/audit", s.requireCapability(rbac.CapAuditRead, s.handleListRunAudit))
+	s.mux.HandleFunc("DELETE /v1/runs/{id}", s.requireCapability(rbac.CapRunCancel, s.handleCancelRun))
+	s.mux.HandleFunc("POST /v1/approvals/{id}", s.requireCapability(rbac.CapApprove, s.handleApproveRun))
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -343,9 +428,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	// Security gate: an unauthenticated server may only listen on loopback.
 	// POST /v1/runs executes arbitrary agent code, so a wildcard/public bind
 	// without a token would be RCE-as-a-service. Fail fast and loud.
-	if s.opts.AuthToken == "" && !isLoopbackAddr(ln.Addr()) {
+	if s.opts.AuthToken == "" && s.opts.Keyring == nil && !isLoopbackAddr(ln.Addr()) {
 		_ = ln.Close()
-		return fmt.Errorf("server: refusing to listen on non-loopback address %s without an auth token (set Options.AuthToken / --api-token or SANDCODE_API_TOKEN)", ln.Addr())
+		return fmt.Errorf("server: refusing to listen on non-loopback address %s without an auth token (set Options.AuthToken / --api-token or SANDCODE_API_TOKEN) or an RBAC keyring", ln.Addr())
 	}
 
 	// Each serve() call resets the launch context so a re-Run() after

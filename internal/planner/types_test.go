@@ -1,10 +1,39 @@
 package planner
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
 )
+
+// TestNode_DoD_JSONRoundTrip verifies the first-class DoD field survives the
+// JSON path the planner LLM tool output flows through (E1.5a), and that DoD is
+// optional (validation passes with or without it).
+func TestNode_DoD_JSONRoundTrip(t *testing.T) {
+	raw := `{"id":"a","prompt":"do x","dod":"go test ./... passes"}`
+	var n Node
+	if err := json.Unmarshal([]byte(raw), &n); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if n.DoD != "go test ./... passes" {
+		t.Errorf("DoD = %q, want %q", n.DoD, "go test ./... passes")
+	}
+	// DoD is optional: a DAG with and without it both validate.
+	withDoD := TaskDAG{Nodes: []Node{n}}
+	if err := withDoD.Validate(); err != nil {
+		t.Errorf("DAG with DoD should validate: %v", err)
+	}
+	noDoD := TaskDAG{Nodes: []Node{{ID: "a", Prompt: "do x"}}}
+	if err := noDoD.Validate(); err != nil {
+		t.Errorf("DAG without DoD should validate: %v", err)
+	}
+	// omitempty: empty DoD does not appear in the marshaled form.
+	out, _ := json.Marshal(Node{ID: "a", Prompt: "p"})
+	if string(out) != `{"id":"a","prompt":"p"}` {
+		t.Errorf("empty DoD should be omitted, got %s", out)
+	}
+}
 
 func TestTaskDAG_Validate_HappyPath(t *testing.T) {
 	d := TaskDAG{Nodes: []Node{

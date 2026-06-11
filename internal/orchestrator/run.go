@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/felipemarques-rec/sandcode/internal/agent"
+	"github.com/felipemarques-rec/sandcode/internal/approval"
 	"github.com/felipemarques-rec/sandcode/internal/auth"
 	"github.com/felipemarques-rec/sandcode/internal/brain"
 	"github.com/felipemarques-rec/sandcode/internal/budget"
@@ -20,6 +22,8 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/kernel"
 	"github.com/felipemarques-rec/sandcode/internal/langfuse"
 	sclog "github.com/felipemarques-rec/sandcode/internal/log"
+	"github.com/felipemarques-rec/sandcode/internal/mcp"
+	"github.com/felipemarques-rec/sandcode/internal/reactor"
 	"github.com/felipemarques-rec/sandcode/internal/redact"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 	"github.com/felipemarques-rec/sandcode/internal/store"
@@ -27,6 +31,10 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// defaultApprovalTimeout bounds the pre-run approval wait when RunOptions
+// leaves ApprovalTimeout unset.
+const defaultApprovalTimeout = 5 * time.Minute
 
 // RunOptions configures a single-agent invocation.
 type RunOptions struct {
@@ -95,13 +103,24 @@ type RunOptions struct {
 
 	// Governance, when non-nil, gates ActionExecute (before agent start)
 	// and ActionRefine (before each refine iteration). A Deny aborts the
-	// run with run.failed; a Review proceeds with a logged warning.
-	// AuditLog (optional) persists every decision.
+	// run with run.failed. At the pre-run ActionExecute gate, a Review blocks
+	// the run in PhaseAwaitingApproval until the Approver resolves it (or
+	// ApprovalTimeout fires → fail-closed); the ActionRefine gate treats
+	// Review as non-blocking (proceeds). AuditLog (optional) persists decisions.
 	Governance *governance.Engine
 
 	// AuditLog, when non-nil, receives one audit row per governance
 	// decision. Failures are logged but never block the run.
 	AuditLog governance.AuditLog
+
+	// Approver, when non-nil, resolves a governance Review verdict at the
+	// pre-run gate — it blocks until approve/reject or ApprovalTimeout. nil ⇒
+	// a Review verdict fails the run (fail-closed). Only consulted when a
+	// Governance engine is configured and returns Review.
+	Approver approval.Approver
+
+	// ApprovalTimeout bounds the pre-run approval wait. 0 ⇒ defaultApprovalTimeout.
+	ApprovalTimeout time.Duration
 
 	// Budget, when non-nil, accumulates per-run consumption (attempts,
 	// tokens, cost) that policies can read via Action.TokensUsed /
@@ -137,6 +156,34 @@ type RunOptions struct {
 	// byte-identical to the legacy behavior. Single-run only: ParallelOptions
 	// and DAGOptions deliberately do NOT carry this field.
 	Verifier Verifier
+
+	// LintCmd, when non-empty AND Refine.Enabled, runs a dedicated Linter Gate
+	// in the live sandbox after a passing verify (E1.5b). A lint failure rides
+	// the refine rails: it triggers a refine attempt and, once attempts are
+	// exhausted, fails the run. Empty ⇒ no lint gate (byte-identical legacy).
+	LintCmd []string
+
+	// Reactive (SP3.2), when true AND a Bus is set, drives the execute/verify/
+	// lint/refine cycle through the deterministic reactor instead of the
+	// imperative attempt loop. The reactor sequences the same step closures, so
+	// the result-event sequence and the Result are byte-identical — only
+	// observation-only command events are added. false ⇒ legacy imperative loop.
+	Reactive bool
+
+	// MCP, when non-nil, injects a project-scoped .mcp.json into the run's
+	// worktree before the agent launches (so MCP-aware agents auto-discover
+	// the configured servers) and emits an observation-only mcp.injected
+	// event. nil ⇒ no injection (byte-identical legacy). The claude-specific
+	// flags that make the servers usable headlessly ride on AgentOpts.ExtraArgs,
+	// built by the CLI.
+	MCP *mcp.Manager
+
+	// Roles, when non-empty, carries the sorted security-role names of the
+	// principal initiating the run; threaded into the logged governance Action
+	// (Action.Roles) so a tool-permission policy can authorize. Empty ⇒ no
+	// principal (CLI/legacy) ⇒ no restriction (byte-identical). Single/Refine
+	// path only.
+	Roles []string
 }
 
 // Result is the outcome of a single Run.
@@ -321,6 +368,15 @@ func Run(
 			Attempt:  attempt,
 			DiffSize: diffSize,
 		}
+		// Thread the principal's roles into the logged Action so a
+		// tool-permission policy can authorize. Sort a defensive copy so the
+		// audited Action is deterministic regardless of caller order. Tool
+		// stays empty at the execute/refine gates (no MCP tool is granted here).
+		if len(opts.Roles) > 0 {
+			roles := slices.Clone(opts.Roles)
+			slices.Sort(roles)
+			act.Roles = roles
+		}
 		if opts.Budget != nil {
 			rep := opts.Budget.Report(runID)
 			act.TokensUsed = rep.Tokens
@@ -340,23 +396,68 @@ func Run(
 				Attempt: attempt,
 				Reasons: d.Reasons,
 			})
-		case governance.Review:
-			publish(ctx, event.GovernanceApprovalRequired, governanceReviewPayload{
-				Action:  string(actionType),
-				Attempt: attempt,
-				Reasons: d.Reasons,
-			})
 		}
 		return d
 	}
 
-	// Pre-run governance gate. A Deny here is the cheapest possible
-	// rejection — no worktree, no sandbox, no API spend.
-	if d := evaluatePolicy(governance.ActionExecute, 1, 0); d.Result == governance.Deny {
+	// awaitApproval parks the run in PhaseAwaitingApproval (via the
+	// GovernanceApprovalRequired event) and blocks on the configured Approver
+	// until a decision arrives or ApprovalTimeout fires. Fail-closed: a nil
+	// approver, a rejection, or a timeout all return an error.
+	awaitApproval := func(ctx context.Context, d governance.Decision) error {
+		publish(ctx, event.GovernanceApprovalRequired, governanceReviewPayload{
+			Action: string(governance.ActionExecute), Attempt: 1, Reasons: d.Reasons,
+		})
+		if opts.Approver == nil {
+			return errors.New("approval required but no approver configured")
+		}
+		timeout := opts.ApprovalTimeout
+		if timeout <= 0 {
+			timeout = defaultApprovalTimeout
+		}
+		actx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		dec, err := opts.Approver.RequestApproval(actx, approval.Request{
+			RunID:   runID,
+			Action:  string(governance.ActionExecute),
+			Attempt: 1,
+			Reasons: d.Reasons,
+		})
+		if err != nil {
+			return fmt.Errorf("approval wait: %w", err)
+		}
+		if !dec.Approved {
+			if dec.Reason != "" {
+				return fmt.Errorf("approval rejected: %s", dec.Reason)
+			}
+			return errors.New("approval rejected")
+		}
+		publish(ctx, event.GovernanceApproved, governanceApprovedPayload{
+			Action: string(governance.ActionExecute), Approver: dec.Approver,
+		})
+		if opts.AuditLog != nil {
+			if lerr := governance.LogApproval(ctx, opts.AuditLog, runID, governance.ActionExecute, dec.Approver); lerr != nil {
+				logger.Warn("audit: log approval failed", "error", lerr, "run_id", runID)
+			}
+		}
+		return nil
+	}
+
+	// Pre-run governance gate. Deny is the cheapest possible rejection — no
+	// worktree, no sandbox, no API spend. Review blocks the run in
+	// PhaseAwaitingApproval until an external decision arrives (E2.3).
+	switch d := evaluatePolicy(governance.ActionExecute, 1, 0); d.Result {
+	case governance.Deny:
 		reason := strings.Join(d.Reasons, "; ")
 		markFailedEarly("governance: " + reason)
 		publish(ctx, event.RunFailed, failedPayload{Reason: "governance", Error: reason})
 		return nil, nil, fmt.Errorf("governance: denied: %s", reason)
+	case governance.Review:
+		if err := awaitApproval(ctx, d); err != nil {
+			markFailedEarly("approval: " + err.Error())
+			publish(ctx, event.RunFailed, failedPayload{Reason: "approval", Error: err.Error()})
+			return nil, nil, fmt.Errorf("approval: %w", err)
+		}
 	}
 
 	// 1. Create worktree
@@ -368,6 +469,26 @@ func Run(
 		markFailedEarly("worktree: " + err.Error())
 		publish(ctx, event.RunFailed, failedPayload{Reason: "worktree", Error: err.Error()})
 		return nil, nil, fmt.Errorf("worktree create: %w", err)
+	}
+
+	// 1b. Inject MCP server configs into the worktree so MCP-aware agents
+	// auto-discover them at their cwd. Done before the sandbox exists so a
+	// failure only needs the worktree torn down (mirrors the auth-failure
+	// cleanup below). No-op when no servers are enabled.
+	if opts.MCP != nil {
+		if enabled := opts.MCP.ListEnabled(ctx); len(enabled) > 0 {
+			if err := opts.MCP.InjectIntoDir(ctx, wt.Path); err != nil {
+				cleanupWorktree(wtMgr, wt, "mcp-inject-failed")
+				markFailedEarly("mcp: " + err.Error())
+				publish(ctx, event.RunFailed, failedPayload{Reason: "mcp", Error: err.Error()})
+				return nil, nil, fmt.Errorf("mcp inject: %w", err)
+			}
+			names := make([]string, len(enabled))
+			for i, c := range enabled {
+				names[i] = c.Name
+			}
+			publish(ctx, event.MCPInjected, mcpInjectedPayload{RunID: runID, Servers: names})
+		}
 	}
 
 	// 2. Build sandbox spec — bind-mount worktree into container
@@ -553,137 +674,221 @@ func Run(
 			opts.Budget.RecordAttempt(runID)
 		}
 
-	attemptLoop:
-		for {
-			// 1. Drain this attempt's agent output + wait for its exit.
-			drainStream(currentLines)
-			execRes = currentWait()
-
-			// 2. Emit agent.completed for THIS attempt. The state machine
-			//    needs the per-attempt signal to model the
-			//    executing → agent_completed → verifying loop correctly.
-			//    DiffSize is filled later (after commit) for the final emission;
-			//    here we use 0 because the diff is computed once in finalize.
-			publish(ctx, event.AgentCompleted, agentCompletedPayload{
-				ExitCode: execRes.ExitCode,
-			})
-
-			// 3. Refine considerations.
-			if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-				break attemptLoop // timeout — caller-side cancellation
-			}
-			if !opts.Refine.active() {
-				break attemptLoop // single-attempt mode
-			}
-			if execRes.ExitCode != 0 {
-				// Agent crashed — refining a broken agent won't help. Bail
-				// out to surface the original failure.
-				break attemptLoop
-			}
-
-			// 4. Run verify in the same sandbox (worktree state intact).
-			publish(ctx, event.VerifyStarted, verifyStartedPayload{
-				Cmd:     opts.Refine.VerifyCmd,
-				Attempt: attempts,
-			})
-			vStart := time.Now()
-
-			// Resolve the Verifier: explicit opts.Verifier wins; otherwise the
-			// default cmdVerifier reproduces the legacy VerifyCmd behavior.
-			verifier := opts.Verifier
-			if verifier == nil {
-				verifier = cmdVerifier{cmd: opts.Refine.VerifyCmd}
-			}
-
-			vOut, vErr := verifier.Verify(runCtx, VerifyInput{
-				Box:       box,
-				Attempt:   attempts,
-				Timeout:   refineCfg.VerifyTimeout,
-				TailBytes: refineCfg.VerifyTailBytes,
-			})
-			if vErr != nil {
-				publish(ctx, event.VerifyFailed, verifyFailedPayload{
-					Attempt: attempts,
-					Error:   vErr.Error(),
-				})
-				execRes.Err = fmt.Errorf("verify exec: %w", vErr)
-				execRes.ExitCode = -1
-				break attemptLoop
-			}
-			lv := vOut
-			lastVerify = &lv
-			vTail := vOut.StdoutTail
-			vDuration := time.Since(vStart).Milliseconds()
-
-			if vOut.Passed {
-				publish(ctx, event.VerifyPassed, verifyPassedPayload{
-					Attempt:    attempts,
-					DurationMS: vDuration,
-				})
-				break attemptLoop // success
-			}
-
-			publish(ctx, event.VerifyFailed, verifyFailedPayload{
-				Attempt:    attempts,
-				ExitCode:   vOut.ExitCode,
-				StdoutTail: vTail,
-			})
-
-			// 5. Verify failed. Refine if local cap allows.
+		// refineOrExhaust handles a refinable gate failure (verify OR lint).
+		// The caller emits the gate-specific *.failed event FIRST; this then
+		// either records a terminal failure and returns true (break the loop),
+		// or bumps the attempt, re-execs the agent (updating currentLines /
+		// currentWait), and returns false (the caller continues the loop).
+		// failCmd/failTail/failExit/gate describe the failed gate so the refine
+		// prompt and the terminal error reference the right command + output.
+		refineOrExhaust := func(failCmd []string, failTail string, failExit int, gate string) bool {
 			if attempts >= refineCfg.MaxAttempts {
-				// Exhausted — surface as run failure with verify context.
-				execRes.ExitCode = vOut.ExitCode
-				execRes.Err = fmt.Errorf("verify failed after %d attempt(s): exit %d",
-					attempts, vOut.ExitCode)
-				break attemptLoop
+				execRes.ExitCode = failExit
+				execRes.Err = fmt.Errorf("%s failed after %d attempt(s): exit %d",
+					gate, attempts, failExit)
+				return true
 			}
-
-			// 5a. Governance gate on the upcoming refine iteration. A Deny
-			//     here short-circuits the loop with run.failed; useful when
-			//     BudgetPolicy or RetryLimit caps fire before the local
-			//     RefineOptions.MaxAttempts limit would have.
+			// Governance gate on the upcoming refine iteration. A Deny here
+			// short-circuits with run.failed when BudgetPolicy / RetryLimit caps
+			// fire before the local RefineOptions.MaxAttempts limit would have.
 			nextAttempt := attempts + 1
 			if d := evaluatePolicy(governance.ActionRefine, nextAttempt, 0); d.Result == governance.Deny {
 				reason := strings.Join(d.Reasons, "; ")
-				execRes.ExitCode = vOut.ExitCode
+				execRes.ExitCode = failExit
 				execRes.Err = fmt.Errorf("governance denied refine: %s", reason)
-				break attemptLoop
+				return true
 			}
-
 			attempts++
 			publish(ctx, event.RefineTriggered, refineTriggeredPayload{
 				Attempt:     attempts,
 				MaxAttempts: refineCfg.MaxAttempts,
 			})
-
-			// Budget: record the new attempt now that policies have approved it.
 			if opts.Budget != nil {
 				opts.Budget.RecordAttempt(runID)
 			}
-
-			// 6. Build refined prompt and re-exec the agent.
 			refinedPrompt := buildRefinePrompt(
-				enrichedPrompt, vTail, attempts, refineCfg.MaxAttempts, opts.Refine.VerifyCmd,
+				enrichedPrompt, failTail, attempts, refineCfg.MaxAttempts, failCmd,
 			)
 			nextAgentOpts := opts.AgentOpts
 			nextAgentOpts.Prompt = refinedPrompt
 			nextAgentOpts.WorkDir = opts.SandboxWorkDir
 			nextCmd := ag.BuildCommand(nextAgentOpts)
-
 			publish(ctx, event.AgentExecuting, agentExecutingPayload{
 				Agent: ag.Name(),
 				Model: opts.AgentOpts.Model,
 			})
-
 			nextLines, nextWait, eErr := box.Exec(runCtx, nextCmd.Argv, nextCmd.Stdin,
 				sandbox.ExecOptions{Env: nextCmd.Env})
 			if eErr != nil {
 				execRes.ExitCode = -1
 				execRes.Err = fmt.Errorf("refine exec: %w", eErr)
-				break attemptLoop
+				return true
 			}
 			currentLines = nextLines
 			currentWait = nextWait
+			return false
+		}
+
+		// lintActive engages the Linter Gate (E1.5b): it needs the refine loop
+		// enabled (for the attempt budget) AND a lint command.
+		lintActive := opts.Refine.Enabled && len(opts.LintCmd) > 0
+
+		// Refine-cycle step outcomes, shared by the imperative attempt loop
+		// (default) and the SP3.2 reactive cycle.
+		const (
+			stepProceed = iota // gate passed; advance to the next step
+			stepReloop         // refine re-exec'd; restart the attempt
+			stepStop           // terminal (success-finished or failure); end the cycle
+		)
+
+		// agentStep drains the current attempt's output, emits agent.completed,
+		// and applies the timeout / no-gate / crash short-circuits. agent.completed
+		// gives the state machine the per-attempt signal it needs.
+		agentStep := func() int {
+			drainStream(currentLines)
+			execRes = currentWait()
+			publish(ctx, event.AgentCompleted, agentCompletedPayload{ExitCode: execRes.ExitCode})
+			if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+				return stepStop // timeout — caller-side cancellation
+			}
+			if !opts.Refine.active() && !lintActive {
+				return stepStop // single-attempt mode (no verify, no lint)
+			}
+			if execRes.ExitCode != 0 {
+				return stepStop // agent crashed — refining won't help
+			}
+			return stepProceed
+		}
+
+		// verifyStep runs the verify gate in the live sandbox. stepProceed =
+		// passed; stepReloop = failed and a refine attempt started; stepStop =
+		// terminal (exec error or exhausted).
+		verifyStep := func() int {
+			publish(ctx, event.VerifyStarted, verifyStartedPayload{Cmd: opts.Refine.VerifyCmd, Attempt: attempts})
+			vStart := time.Now()
+			verifier := opts.Verifier
+			if verifier == nil {
+				verifier = cmdVerifier{cmd: opts.Refine.VerifyCmd}
+			}
+			vOut, vErr := verifier.Verify(runCtx, VerifyInput{
+				Box: box, Attempt: attempts, Timeout: refineCfg.VerifyTimeout, TailBytes: refineCfg.VerifyTailBytes,
+			})
+			if vErr != nil {
+				publish(ctx, event.VerifyFailed, verifyFailedPayload{Attempt: attempts, Error: vErr.Error()})
+				execRes.Err = fmt.Errorf("verify exec: %w", vErr)
+				execRes.ExitCode = -1
+				return stepStop
+			}
+			lv := vOut
+			lastVerify = &lv
+			if !vOut.Passed {
+				publish(ctx, event.VerifyFailed, verifyFailedPayload{Attempt: attempts, ExitCode: vOut.ExitCode, StdoutTail: vOut.StdoutTail})
+				if refineOrExhaust(opts.Refine.VerifyCmd, vOut.StdoutTail, vOut.ExitCode, "verify") {
+					return stepStop
+				}
+				return stepReloop
+			}
+			publish(ctx, event.VerifyPassed, verifyPassedPayload{Attempt: attempts, DurationMS: time.Since(vStart).Milliseconds()})
+			return stepProceed
+		}
+
+		// lintStep runs the Linter Gate after a passing verify. Same outcome
+		// semantics as verifyStep — a lint failure rides the same refine rails.
+		lintStep := func() int {
+			publish(ctx, event.LintStarted, lintStartedPayload{Cmd: opts.LintCmd, Attempt: attempts})
+			lStart := time.Now()
+			lOut, lErr := cmdVerifier{cmd: opts.LintCmd}.Verify(runCtx, VerifyInput{
+				Box: box, Attempt: attempts, Timeout: refineCfg.VerifyTimeout, TailBytes: refineCfg.VerifyTailBytes,
+			})
+			if lErr != nil {
+				publish(ctx, event.LintFailed, lintFailedPayload{Attempt: attempts, Error: lErr.Error()})
+				execRes.Err = fmt.Errorf("lint exec: %w", lErr)
+				execRes.ExitCode = -1
+				return stepStop
+			}
+			if !lOut.Passed {
+				publish(ctx, event.LintFailed, lintFailedPayload{Attempt: attempts, ExitCode: lOut.ExitCode, StdoutTail: lOut.StdoutTail})
+				if refineOrExhaust(opts.LintCmd, lOut.StdoutTail, lOut.ExitCode, "lint") {
+					return stepStop
+				}
+				return stepReloop
+			}
+			publish(ctx, event.LintPassed, lintPassedPayload{Attempt: attempts, DurationMS: time.Since(lStart).Milliseconds()})
+			return stepProceed
+		}
+
+		if opts.Reactive && opts.Bus != nil {
+			// SP3.2 reactive cycle: a per-run reactor sequences the steps via
+			// observation-only command events (execute/verify/lint.requested).
+			// The steps use the SAME closures as the imperative loop, so the
+			// result-event sequence and the Result are byte-identical — only the
+			// command events are added. Deterministic: one event at a time.
+			cmdEvent := func(typ event.Type) event.Event {
+				ev := event.New(typ, runID, nil).WithCorrelation(runID)
+				if opts.ParentRunID != "" {
+					ev.ParentRunID = opts.ParentRunID
+				}
+				return ev
+			}
+			rc := reactor.New(opts.Bus)
+			rc.Register(event.ExecuteRequested, func(_ context.Context, _ event.Event) ([]event.Event, error) {
+				if agentStep() == stepStop {
+					return nil, nil
+				}
+				if opts.Refine.active() {
+					return []event.Event{cmdEvent(event.VerifyRequested)}, nil
+				}
+				if lintActive {
+					return []event.Event{cmdEvent(event.LintRequested)}, nil
+				}
+				return nil, nil // success, no gates
+			})
+			rc.Register(event.VerifyRequested, func(_ context.Context, _ event.Event) ([]event.Event, error) {
+				switch verifyStep() {
+				case stepStop:
+					return nil, nil
+				case stepReloop:
+					return []event.Event{cmdEvent(event.ExecuteRequested)}, nil
+				}
+				if lintActive {
+					return []event.Event{cmdEvent(event.LintRequested)}, nil
+				}
+				return nil, nil // success
+			})
+			rc.Register(event.LintRequested, func(_ context.Context, _ event.Event) ([]event.Event, error) {
+				switch lintStep() {
+				case stepStop:
+					return nil, nil
+				case stepReloop:
+					return []event.Event{cmdEvent(event.ExecuteRequested)}, nil
+				}
+				return nil, nil // success
+			})
+			_, _ = rc.Dispatch(runCtx, runID, cmdEvent(event.ExecuteRequested))
+		} else {
+		attemptLoop:
+			for {
+				if agentStep() == stepStop {
+					break attemptLoop
+				}
+				if opts.Refine.active() {
+					switch verifyStep() {
+					case stepStop:
+						break attemptLoop
+					case stepReloop:
+						continue attemptLoop
+					}
+				}
+				if lintActive {
+					switch lintStep() {
+					case stepStop:
+						break attemptLoop
+					case stepReloop:
+						continue attemptLoop
+					}
+				}
+				break attemptLoop // all configured gates passed → success
+			}
 		}
 
 		// === Single-pass finalization (runs once regardless of attempts) ===
@@ -696,6 +901,14 @@ func Run(
 		}
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			status = "cancelled"
+		}
+
+		// Drop the injected .mcp.json before committing so the runtime MCP
+		// config never leaks into the agent's diff/commit/merge. Best-effort.
+		if opts.MCP != nil {
+			if rmErr := opts.MCP.RemoveFromDir(wt.Path); rmErr != nil {
+				logger.Warn("mcp cleanup failed", "error", rmErr, "run_id", runID)
+			}
 		}
 
 		// Commit changes inside the worktree so diff/merge see them as commits.
@@ -817,6 +1030,12 @@ type submittedPayload struct {
 	Strategy string `json:"strategy"`
 }
 
+// mcpInjectedPayload accompanies the observation-only event.MCPInjected.
+type mcpInjectedPayload struct {
+	RunID   string   `json:"run_id"`
+	Servers []string `json:"servers"`
+}
+
 type sandboxCreatedPayload struct {
 	Image   string `json:"image"`
 	WorkDir string `json:"workdir"`
@@ -869,6 +1088,25 @@ type refineTriggeredPayload struct {
 	MaxAttempts int `json:"max_attempts"`
 }
 
+// Linter Gate payloads (E1.5b). Mirror the verify payload shapes so SSE/
+// trace consumers parse them uniformly.
+type lintStartedPayload struct {
+	Cmd     []string `json:"cmd"`
+	Attempt int      `json:"attempt"`
+}
+
+type lintPassedPayload struct {
+	Attempt    int   `json:"attempt"`
+	DurationMS int64 `json:"duration_ms"`
+}
+
+type lintFailedPayload struct {
+	Attempt    int    `json:"attempt"`
+	ExitCode   int    `json:"exit_code"`
+	StdoutTail string `json:"stdout_tail,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
 type governanceDeniedPayload struct {
 	Action  string   `json:"action"`
 	Attempt int      `json:"attempt,omitempty"`
@@ -879,4 +1117,9 @@ type governanceReviewPayload struct {
 	Action  string   `json:"action"`
 	Attempt int      `json:"attempt,omitempty"`
 	Reasons []string `json:"reasons,omitempty"`
+}
+
+type governanceApprovedPayload struct {
+	Action   string `json:"action"`
+	Approver string `json:"approver"`
 }

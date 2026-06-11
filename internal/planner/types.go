@@ -22,10 +22,18 @@ import (
 // Reviewer, etc.) should execute the node — empty means "use the
 // default agent". Slice 1 does not interpret this field; Slice 3+
 // (multi-role coordination) will.
+//
+// DoD (Definition of Done) is an optional, concrete, checkable acceptance
+// criterion for the node — the "Definition of Done" box from the diagram's
+// Setup Phase, made first-class per subtask. When set, the DAG executor
+// surfaces it to the agent as an explicit acceptance criterion (see
+// buildHandoffPrompt). Empty means "the prompt is the implicit DoD" — the
+// legacy behavior (byte-identical).
 type Node struct {
 	ID        string   `json:"id"`
 	Prompt    string   `json:"prompt"`
 	Role      string   `json:"role,omitempty"`
+	DoD       string   `json:"dod,omitempty"`
 	DependsOn []string `json:"depends_on,omitempty"`
 }
 

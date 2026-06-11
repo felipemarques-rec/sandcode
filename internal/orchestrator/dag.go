@@ -22,6 +22,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/judge"
 	"github.com/felipemarques-rec/sandcode/internal/kernel"
 	"github.com/felipemarques-rec/sandcode/internal/langfuse"
+	"github.com/felipemarques-rec/sandcode/internal/mcp"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 	"github.com/felipemarques-rec/sandcode/internal/store"
@@ -93,6 +94,11 @@ type DAGOptions struct {
 	// under --parallel N or multi-agent. Zero for solo runs. Embedded
 	// in events for cross-copy correlation.
 	OuterCopyIndex int
+
+	// MCP, when non-nil, injects a .mcp.json into each chain worktree (and,
+	// for the degenerate single-node DAG, into the delegated Run). nil ⇒ no
+	// injection (byte-identical legacy).
+	MCP *mcp.Manager
 }
 
 // SynthesizerOptions controls the consolidation pass. Zero value =

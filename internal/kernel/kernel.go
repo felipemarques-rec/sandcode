@@ -21,6 +21,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/event"
 	sclog "github.com/felipemarques-rec/sandcode/internal/log"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
+	"github.com/felipemarques-rec/sandcode/internal/reactor"
 	"github.com/felipemarques-rec/sandcode/internal/strategy"
 )
 
@@ -66,6 +67,15 @@ func WithSelector(s strategy.Selector) Option {
 	return func(k *Kernel) { k.selector = s }
 }
 
+// WithReactive routes the classify stage through the deterministic reactor
+// (SP3.0) instead of calling the classifier directly — the proof-of-concept
+// for bus-mediated, event-driven coordination. Requires a Bus (WithBus); with
+// no bus the flag is inert and the direct path runs. Off by default ⇒ the
+// direct call path is byte-identical to legacy. SP3.1+ invert further stages.
+func WithReactive() Option {
+	return func(k *Kernel) { k.reactive = true }
+}
+
 // Kernel coordinates cognition, memory recall, prompt enrichment,
 // and strategy selection for each run.
 type Kernel struct {
@@ -78,6 +88,7 @@ type Kernel struct {
 	bus        event.Bus
 	tracer     Tracer
 	logger     *slog.Logger
+	reactive   bool // SP3.0: route classify through the reactor
 }
 
 // New creates a Kernel. brain may be nil for runs without learning.
@@ -128,136 +139,140 @@ type ProcessResult struct {
 	StrategyReason string
 }
 
-// Process runs the cognitive pipeline: classify → recall → enrich.
-// All steps degrade gracefully — errors produce warnings, not failures.
-// When a Bus is configured, events are emitted at each stage.
+// Process runs the cognitive pipeline: classify → architect → plan → strategy
+// → enrich. All steps degrade gracefully — errors produce warnings, not
+// failures. When a Bus is configured, events are emitted at each stage.
+//
+// With WithReactive (SP3.0/SP3.1) each stage runs through the deterministic
+// reactor: the kernel sequences the stages and applies the gating (kernel-
+// conducted), while each stage is a reactor handler that consumes its
+// observation-only command and publishes its result. The default (direct) path
+// is byte-identical — same result events, same order, same payloads.
 func (k *Kernel) Process(ctx context.Context, req ProcessRequest) ProcessResult {
 	ctx = sclog.WithCorrelation(ctx, req.RunID)
 	logger := sclog.Logger(ctx)
 
-	// 1. Classify
-	cctx, endClassify := k.tracer.Start(ctx, "kernel.classify", nil)
-	classification := k.classifier.Classify(cctx, req.Prompt)
-	endClassify(nil)
+	// 1. Classify (always runs).
+	var classification brain.Classification
+	k.stage(ctx, req.RunID, event.ClassifyRequested,
+		classifyRequestedPayload{PromptLen: len(req.Prompt)},
+		func(wctx context.Context) []event.Event {
+			cctx, end := k.tracer.Start(wctx, "kernel.classify", nil)
+			classification = k.classifier.Classify(cctx, req.Prompt)
+			end(nil)
+			return []event.Event{k.buildEvent(wctx, event.RunClassified, req.RunID, classificationPayload{
+				Type:       string(classification.Type),
+				Complexity: string(classification.Complexity),
+				Reasoning:  classification.Reasoning,
+			})}
+		})
 	logger.Info("prompt classified",
-		"type", string(classification.Type),
-		"complexity", string(classification.Complexity),
-	)
-	k.publish(ctx, event.RunClassified, req.RunID, classificationPayload{
-		Type:       string(classification.Type),
-		Complexity: string(classification.Complexity),
-		Reasoning:  classification.Reasoning,
-	})
+		"type", string(classification.Type), "complexity", string(classification.Complexity))
 
-	// 1.5 Architect (opt-in; gated on divergent OR high). Designs guidance
-	// that is prepended to the working prompt feeding plan + enrich + execute.
-	// Failures degrade gracefully (warn + raw prompt). nil ⇒ byte-identical.
+	// 1.5 Architect (gated on divergent OR high). Designs guidance prepended to
+	// the working prompt feeding plan + enrich. Failures degrade gracefully.
 	workingPrompt := req.Prompt
 	var arch *architect.ArchPlan
 	if k.architect != nil &&
 		(classification.Type == brain.Divergent || classification.Complexity == brain.ComplexityHigh) {
-		actx, endArch := k.tracer.Start(ctx, "kernel.architect", nil)
-		ap, err := k.architect.Design(actx, architect.DesignRequest{
-			Prompt:      req.Prompt,
-			ProblemType: string(classification.Type),
-			Complexity:  string(classification.Complexity),
-		})
-		endArch(err)
-		if err != nil {
-			logger.Warn("architect design failed, proceeding without guidance", "error", err)
-		} else {
-			arch = &ap
-			workingPrompt = formatArchGuidance(ap) + req.Prompt
-			logger.Info("architecture designed",
-				"files", len(ap.Files), "risks", len(ap.Risks))
-			k.publish(ctx, event.RunArchitected, req.RunID, architectedPayload{
-				RunID:       req.RunID,
-				ApproachLen: len(ap.Approach),
-				FilesCount:  len(ap.Files),
-				RisksCount:  len(ap.Risks),
-				Architect:   ap.Architect,
+		k.stage(ctx, req.RunID, event.ArchitectRequested,
+			architectRequestedPayload{Complexity: string(classification.Complexity), ProblemType: string(classification.Type)},
+			func(wctx context.Context) []event.Event {
+				actx, end := k.tracer.Start(wctx, "kernel.architect", nil)
+				ap, err := k.architect.Design(actx, architect.DesignRequest{
+					Prompt:      req.Prompt,
+					ProblemType: string(classification.Type),
+					Complexity:  string(classification.Complexity),
+				})
+				end(err)
+				if err != nil {
+					logger.Warn("architect design failed, proceeding without guidance", "error", err)
+					return nil
+				}
+				arch = &ap
+				workingPrompt = formatArchGuidance(ap) + req.Prompt
+				logger.Info("architecture designed", "files", len(ap.Files), "risks", len(ap.Risks))
+				return []event.Event{k.buildEvent(wctx, event.RunArchitected, req.RunID, architectedPayload{
+					RunID:       req.RunID,
+					ApproachLen: len(ap.Approach),
+					FilesCount:  len(ap.Files),
+					RisksCount:  len(ap.Risks),
+					Architect:   ap.Architect,
+				})}
 			})
-		}
 	}
 
-	// 2. Plan (high-complexity decomposition into TaskDAG).
-	// Gated on complexity to avoid the LLM round-trip for simple
-	// prompts; failures degrade gracefully (warn + empty plan).
+	// 2. Plan (gated on high complexity to avoid the LLM round-trip on simple
+	// prompts). Failures degrade gracefully (warn + empty plan).
 	var plan planner.TaskDAG
 	if k.planner != nil && classification.Complexity == brain.ComplexityHigh {
-		pctx, endPlan := k.tracer.Start(ctx, "kernel.plan", nil)
-		dag, err := k.planner.Decompose(pctx, workingPrompt)
-		endPlan(err)
-		if err != nil {
-			logger.Warn("planner decompose failed, proceeding without plan", "error", err)
-		} else {
-			plan = dag
-			logger.Info("prompt decomposed",
-				"nodes", len(plan.Nodes),
-				"roots", len(plan.Roots()),
-			)
-			k.publish(ctx, event.RunPlanned, req.RunID, planPayload{
-				NodeCount: len(plan.Nodes),
-				RootCount: len(plan.Roots()),
+		k.stage(ctx, req.RunID, event.PlanRequested,
+			planRequestedPayload{PromptLen: len(workingPrompt)},
+			func(wctx context.Context) []event.Event {
+				pctx, end := k.tracer.Start(wctx, "kernel.plan", nil)
+				dag, err := k.planner.Decompose(pctx, workingPrompt)
+				end(err)
+				if err != nil {
+					logger.Warn("planner decompose failed, proceeding without plan", "error", err)
+					return nil
+				}
+				plan = dag
+				logger.Info("prompt decomposed", "nodes", len(plan.Nodes), "roots", len(plan.Roots()))
+				return []event.Event{k.buildEvent(wctx, event.RunPlanned, req.RunID, planPayload{
+					NodeCount: len(plan.Nodes), RootCount: len(plan.Roots()),
+				})}
 			})
-		}
 	}
 
-	// 3. Strategy select (deterministic, rule-based). Pure function
-	// of classification + plan; no LLM in this hot path. The empty
-	// Strategy is the conservative default when no selector is wired.
+	// 3. Strategy select (deterministic, rule-based; when a selector is wired).
 	var chosen strategy.Strategy
 	var reason string
 	if k.selector != nil {
-		_, endStrat := k.tracer.Start(ctx, "kernel.strategy", nil)
-		chosen, reason = k.selector.Select(classification, plan)
-		endStrat(nil)
-		logger.Info("strategy selected",
-			"strategy", string(chosen),
-			"reason", reason,
-		)
-		k.publish(ctx, event.RunStrategySelected, req.RunID, strategyPayload{
-			Strategy: string(chosen),
-			Reason:   reason,
-		})
+		k.stage(ctx, req.RunID, event.StrategyRequested, strategyRequestedPayload{},
+			func(wctx context.Context) []event.Event {
+				_, end := k.tracer.Start(wctx, "kernel.strategy", nil)
+				chosen, reason = k.selector.Select(classification, plan)
+				end(nil)
+				logger.Info("strategy selected", "strategy", string(chosen), "reason", reason)
+				return []event.Event{k.buildEvent(wctx, event.RunStrategySelected, req.RunID, strategyPayload{
+					Strategy: string(chosen), Reason: reason,
+				})}
+			})
 	}
 
-	// 4. Enrich (includes recall + Grill with Docs)
+	// 4. Enrich (recall + Grill with Docs; when an enricher is wired). Recall
+	// emits brain.lesson_recalled (observation-only, published directly so it
+	// precedes enrich exactly as the legacy path does) before run.enriched.
 	enrichedPrompt := req.Prompt
 	lessonsUsed := 0
 	if k.enricher != nil {
-		// Recall first so we can emit a lesson_recalled event with the count
-		// — the Enricher will recall again internally; this is cheap (SQL).
-		if k.brain != nil {
-			if lessons, err := k.brain.Recall(ctx, req.Prompt, 10); err == nil {
-				lessonsUsed = len(lessons)
-				if lessonsUsed > 0 {
-					k.publish(ctx, event.BrainLessonRecalled, req.RunID, lessonRecallPayload{
-						Count:     lessonsUsed,
-						LessonIDs: lessonIDs(lessons),
-					})
+		k.stage(ctx, req.RunID, event.EnrichRequested,
+			enrichRequestedPayload{PromptLen: len(workingPrompt)},
+			func(wctx context.Context) []event.Event {
+				if k.brain != nil {
+					if lessons, err := k.brain.Recall(wctx, req.Prompt, 10); err == nil {
+						lessonsUsed = len(lessons)
+						if lessonsUsed > 0 {
+							k.publish(wctx, event.BrainLessonRecalled, req.RunID, lessonRecallPayload{
+								Count: lessonsUsed, LessonIDs: lessonIDs(lessons),
+							})
+						}
+					}
 				}
-			}
-		}
-
-		ectx, endEnrich := k.tracer.Start(ctx, "kernel.enrich", nil)
-		ep, err := k.enricher.Enrich(ectx, workingPrompt, req.CWD)
-		endEnrich(err)
-		if err != nil {
-			logger.Warn("enrichment failed, using raw prompt", "error", err)
-		} else {
-			enrichedPrompt = ep
-			logger.Info("prompt enriched",
-				"original_len", len(req.Prompt),
-				"enriched_len", len(enrichedPrompt),
-				"lessons_used", lessonsUsed,
-			)
-			k.publish(ctx, event.RunEnriched, req.RunID, enrichmentPayload{
-				OriginalLen: len(req.Prompt),
-				EnrichedLen: len(enrichedPrompt),
-				LessonsUsed: lessonsUsed,
+				ectx, end := k.tracer.Start(wctx, "kernel.enrich", nil)
+				ep, err := k.enricher.Enrich(ectx, workingPrompt, req.CWD)
+				end(err)
+				if err != nil {
+					logger.Warn("enrichment failed, using raw prompt", "error", err)
+					return nil
+				}
+				enrichedPrompt = ep
+				logger.Info("prompt enriched", "original_len", len(req.Prompt),
+					"enriched_len", len(enrichedPrompt), "lessons_used", lessonsUsed)
+				return []event.Event{k.buildEvent(wctx, event.RunEnriched, req.RunID, enrichmentPayload{
+					OriginalLen: len(req.Prompt), EnrichedLen: len(enrichedPrompt), LessonsUsed: lessonsUsed,
+				})}
 			})
-		}
 	}
 
 	return ProcessResult{
@@ -268,6 +283,35 @@ func (k *Kernel) Process(ctx context.Context, req ProcessRequest) ProcessResult 
 		Arch:           arch,
 		Strategy:       chosen,
 		StrategyReason: reason,
+	}
+}
+
+// stage runs one cognitive stage. work does the stage's computation (setting the
+// caller's captured result variables) and returns the result event(s) to emit,
+// in order. work ALWAYS runs (even with no bus) so the kernel's result is
+// populated. Direct mode publishes each result event. Reactive mode
+// (WithReactive + bus) publishes an observation-only command (cmdType/payload),
+// runs work inside a per-call reactor handler, and lets the reactor publish the
+// results — adding only the command event vs the direct path.
+func (k *Kernel) stage(ctx context.Context, runID string, cmdType event.Type, cmdPayload any, work func(context.Context) []event.Event) {
+	if k.reactive && k.bus != nil {
+		r := reactor.New(k.bus)
+		r.Register(cmdType, func(hctx context.Context, _ event.Event) ([]event.Event, error) {
+			return work(hctx), nil
+		})
+		if _, err := r.Dispatch(ctx, runID, k.buildEvent(ctx, cmdType, runID, cmdPayload)); err != nil {
+			sclog.Logger(ctx).Warn("reactor stage failed", "cmd", string(cmdType), "error", err)
+		}
+		return
+	}
+	for _, ev := range work(ctx) {
+		if k.bus == nil {
+			continue
+		}
+		if err := k.bus.Publish(ctx, ev); err != nil {
+			sclog.Logger(ctx).Warn("kernel: event publish failed",
+				"error", err, "event_type", string(ev.Type), "run_id", runID)
+		}
 	}
 }
 
@@ -305,25 +349,55 @@ func (k *Kernel) Stats(ctx context.Context) (brain.Stats, error) {
 	return k.brain.Stats(ctx)
 }
 
-// publish emits an event on the configured bus. No-op when bus is nil.
-// Marshal failures are logged but never fail the cognitive pipeline.
-func (k *Kernel) publish(ctx context.Context, typ event.Type, runID string, payload any) {
-	if k.bus == nil {
-		return
-	}
+// buildEvent constructs a fully-stamped event (correlation + trace) without
+// publishing. Shared by publish (direct path) and the reactor handlers (SP3.0
+// reactive path), so a reactor-produced event is byte-identical to one publish
+// would emit. Marshal failures degrade to an empty payload, never panic.
+func (k *Kernel) buildEvent(ctx context.Context, typ event.Type, runID string, payload any) event.Event {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		sclog.Logger(ctx).Warn("kernel: event marshal failed",
 			"error", err, "event_type", string(typ), "run_id", runID)
 		raw = []byte("{}")
 	}
-	ev := event.New(typ, runID, raw).
+	return event.New(typ, runID, raw).
 		WithCorrelation(runID).
 		WithTrace(k.tracer.TraceID(ctx))
+}
+
+// publish emits an event on the configured bus. No-op when bus is nil.
+// Marshal failures are logged but never fail the cognitive pipeline.
+func (k *Kernel) publish(ctx context.Context, typ event.Type, runID string, payload any) {
+	if k.bus == nil {
+		return
+	}
+	ev := k.buildEvent(ctx, typ, runID, payload)
 	if err := k.bus.Publish(ctx, ev); err != nil {
 		sclog.Logger(ctx).Warn("kernel: event publish failed",
 			"error", err, "event_type", string(typ), "run_id", runID)
 	}
+}
+
+// Reactor command payloads (SP3.0/SP3.1). They deliberately carry only metadata
+// (lengths, classification labels) — never raw prompt content — so command
+// events leak nothing to bus observers.
+type classifyRequestedPayload struct {
+	PromptLen int `json:"prompt_len"`
+}
+
+type architectRequestedPayload struct {
+	Complexity  string `json:"complexity"`
+	ProblemType string `json:"problem_type"`
+}
+
+type planRequestedPayload struct {
+	PromptLen int `json:"prompt_len"`
+}
+
+type strategyRequestedPayload struct{}
+
+type enrichRequestedPayload struct {
+	PromptLen int `json:"prompt_len"`
 }
 
 // classificationPayload is the JSON shape of run.classified events.

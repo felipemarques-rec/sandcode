@@ -53,6 +53,33 @@ const (
 	RefineTriggered Type = "refine.triggered"
 )
 
+// Linter Gate events (E1.5b). The lint gate runs after a passing verify; a
+// lint failure rides the refine rails (lint.failed → refining), so these are
+// NOT observation-only — they drive PhaseLinting transitions.
+const (
+	LintStarted Type = "lint.started"
+	LintPassed  Type = "lint.passed"
+	LintFailed  Type = "lint.failed"
+)
+
+// Reactor command events (SP3.0/SP3.1). Commands are observation-only — they
+// request work from a reactor handler that publishes the corresponding result
+// event (e.g. classify.requested → run.classified). They never transition phase.
+const (
+	ClassifyRequested  Type = "classify.requested"
+	ArchitectRequested Type = "architect.requested"
+	PlanRequested      Type = "plan.requested"
+	StrategyRequested  Type = "strategy.requested"
+	EnrichRequested    Type = "enrich.requested"
+
+	// Refine-cycle commands (SP3.2) sequence the reactive execute/verify/lint
+	// cycle. Observation-only — the result events (agent.*/verify.*/lint.*/
+	// refine.triggered) still drive the phase transitions.
+	ExecuteRequested Type = "execute.requested"
+	VerifyRequested  Type = "verify.requested"
+	LintRequested    Type = "lint.requested"
+)
+
 // DAG executor lifecycle events. All observation-only — they increment
 // EventCount but do not transition phase. Slice 4 (W12) introduces these.
 const (
@@ -92,6 +119,11 @@ const (
 	// RefactoringReviewed is emitted (observation-only) after a Refactoring
 	// Specialist scores a run's diff. It never changes run status.
 	RefactoringReviewed Type = "refactor.reviewed"
+
+	// MCPInjected is emitted (observation-only) after MCP server configs are
+	// written into a run's worktree (.mcp.json). It never changes run status
+	// or phase and is absent from the runtime transition table.
+	MCPInjected Type = "mcp.injected"
 )
 
 // Brain events.

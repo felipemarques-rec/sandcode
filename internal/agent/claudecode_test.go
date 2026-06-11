@@ -36,6 +36,20 @@ func TestClaudeCodeBuildCommand(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeBuildCommand_MCPArgs(t *testing.T) {
+	c := NewClaudeCode()
+	mcpArgs := []string{"--strict-mcp-config", "--mcp-config", ".mcp.json", "--allowedTools", "mcp__context7 mcp__claude-mem"}
+	cmd := c.BuildCommand(RunOptions{Prompt: "x", ExtraArgs: mcpArgs})
+
+	// The MCP flags must appear verbatim, in order, at the tail of argv.
+	tail := cmd.Argv[len(cmd.Argv)-len(mcpArgs):]
+	for i, w := range mcpArgs {
+		if tail[i] != w {
+			t.Fatalf("tail[%d]=%q, want %q (argv=%v)", i, tail[i], w, cmd.Argv)
+		}
+	}
+}
+
 func TestClaudeCodeParseLine(t *testing.T) {
 	c := NewClaudeCode()
 

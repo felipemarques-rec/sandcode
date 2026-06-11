@@ -33,9 +33,13 @@ const (
 // Backticks (triple) in prev content are neutralized to keep the
 // surrounding markdown well-formed when the handoff bubbles up into
 // the synthesizer / judge.
+//
+// When node.DoD is set, an explicit "Definition of done" criterion is
+// appended last (after any handoff block). Empty DoD leaves the prompt
+// byte-identical to the legacy output.
 func buildHandoffPrompt(node planner.Node, prev []NodeResult) string {
 	if len(prev) == 0 {
-		return node.Prompt
+		return appendDoD(node.Prompt, node.DoD)
 	}
 
 	var b strings.Builder
@@ -77,7 +81,17 @@ func buildHandoffPrompt(node planner.Node, prev []NodeResult) string {
 	b.WriteString(stripBackticks(truncate(last.Result.Completion, handoffMaxFinalNoteChars)))
 	b.WriteString("\n---\n")
 
-	return b.String()
+	return appendDoD(b.String(), node.DoD)
+}
+
+// appendDoD appends an explicit Definition-of-Done acceptance criterion to
+// a node prompt. Empty dod returns base unchanged (byte-identical legacy).
+func appendDoD(base, dod string) string {
+	dod = strings.TrimSpace(dod)
+	if dod == "" {
+		return base
+	}
+	return base + "\n\n## Definition of done\n" + dod + "\n"
 }
 
 func truncate(s string, max int) string {
