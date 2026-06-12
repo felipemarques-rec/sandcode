@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -20,6 +21,10 @@ const (
 	StatusFailure   RunStatus = "failure"
 	StatusCancelled RunStatus = "cancelled"
 )
+
+// ErrRunNotFound is returned (wrapped) by GetRun when no run matches the id.
+// Callers distinguish "no such run" from operational failures with errors.Is.
+var ErrRunNotFound = errors.New("run not found")
 
 // Run represents one orchestrated agent invocation.
 type Run struct {

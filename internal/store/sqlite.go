@@ -169,7 +169,7 @@ func (s *SQLite) GetRun(ctx context.Context, runID string) (Run, error) {
         FROM runs WHERE id=?`, runID)
 	r, err := scanRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Run{}, fmt.Errorf("run %q not found", runID)
+		return Run{}, fmt.Errorf("run %q: %w", runID, ErrRunNotFound)
 	}
 	return r, err
 }

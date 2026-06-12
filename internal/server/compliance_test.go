@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -146,5 +147,39 @@ func TestCompliance_RBACForbidden(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("auditor: got %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// errStore embeds the store.Store interface (nil) and overrides only GetRun to
+// return an operational (non-not-found) error, exercising the 500 path.
+type errStore struct{ store.Store }
+
+func (errStore) GetRun(ctx context.Context, id string) (store.Run, error) {
+	return store.Run{}, errors.New("db exploded")
+}
+
+func TestCompliance_StoreError500(t *testing.T) {
+	_, al := seedComplianceStores(t)
+	s := New(Options{
+		Registry: metrics.NewRegistry(), StateCache: NewStateCache(DefaultStateCacheCapacity),
+		Audit: al, RunStore: errStore{},
+	})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/runs/run-1/compliance", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("got %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCompliance_RealStoreUnknownRun404(t *testing.T) {
+	st, al := seedComplianceStores(t)
+	s := New(Options{
+		Registry: metrics.NewRegistry(), StateCache: NewStateCache(DefaultStateCacheCapacity),
+		Audit: al, RunStore: st,
+	})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/runs/ghost/compliance", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404 (store not-found falls back, cache miss): %s", rec.Code, rec.Body.String())
 	}
 }
