@@ -45,7 +45,7 @@ func (s *Server) handleRunCompliance(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.opts.Audit.ListByRun(r.Context(), runID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal error"})
 		return
 	}
 
