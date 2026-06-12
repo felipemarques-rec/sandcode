@@ -412,6 +412,7 @@ func runServe(ctx context.Context, f serveFlags) error {
 		StateCache: stateCache,
 		Bus:        bus,
 		Store:      eventStore,
+		RunStore:   runStore,
 		Audit:      auditLog,
 		Launcher:   launcher,
 		Approvals:  approvalReg,
