@@ -43,9 +43,10 @@ func (r Report) RenderMarkdown() string {
 		b.WriteString("| Time | Result | Action | Policy | Approver | Reasons |\n")
 		b.WriteString("|---|---|---|---|---|---|\n")
 		for _, d := range r.Decisions {
-			reasons := strings.ReplaceAll(strings.Join(d.Reasons, "; "), "\n", " ")
+			reasons := mdCell(strings.Join(d.Reasons, "; "))
 			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s |\n",
-				d.At.Format(time.RFC3339), d.Result, d.ActionType, d.PolicyName, d.Approver, reasons)
+				d.At.Format(time.RFC3339), mdCell(d.Result), mdCell(d.ActionType),
+				mdCell(d.PolicyName), mdCell(d.Approver), reasons)
 		}
 	}
 
@@ -61,4 +62,10 @@ func (r Report) RenderMarkdown() string {
 	b.WriteString("\n## Integrity\n\n")
 	fmt.Fprintf(&b, "- **%s:** `%s`\n", r.Integrity.Algorithm, r.Integrity.Digest)
 	return b.String()
+}
+
+// mdCell makes a string safe to drop into a Markdown table cell: collapse
+// newlines and escape pipes so cell content can't inject extra columns.
+func mdCell(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "|", "\\|")
 }

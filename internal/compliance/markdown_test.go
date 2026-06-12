@@ -31,3 +31,18 @@ func TestRenderMarkdown_EmptyDecisions(t *testing.T) {
 		t.Fatalf("missing empty-state line:\n%s", md)
 	}
 }
+
+func TestRenderMarkdown_EscapesPipesAndOrdersSummary(t *testing.T) {
+	in := sampleInput()
+	in.AuditRows[1].Reasons = []string{"a | b"} // pipe in a reason
+	md := Build(in).RenderMarkdown()
+	if !strings.Contains(md, `a \| b`) {
+		t.Fatalf("pipe not escaped in reasons:\n%s", md)
+	}
+	ai := strings.Index(md, "- **allow:**")
+	ri := strings.Index(md, "- **review:**")
+	pi := strings.Index(md, "- **approved:**")
+	if ai < 0 || ri < 0 || pi < 0 || !(ai < ri && ri < pi) {
+		t.Fatalf("summary order wrong: allow=%d review=%d approved=%d\n%s", ai, ri, pi, md)
+	}
+}
