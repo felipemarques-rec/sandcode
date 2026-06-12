@@ -19,6 +19,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/ratelimit"
 	"github.com/felipemarques-rec/sandcode/internal/rbac"
 	"github.com/felipemarques-rec/sandcode/internal/scheduler"
+	"github.com/felipemarques-rec/sandcode/internal/store"
 )
 
 // Options configures Server construction.
@@ -40,6 +41,11 @@ type Options struct {
 	// SSE endpoint behaves as live-tail-only and rejects any request
 	// that specifies `from` with 503 ServiceUnavailable.
 	Store event.Store
+
+	// RunStore backs run identity on GET /v1/runs/{id}/compliance. Optional —
+	// when nil the handler falls back to StateCache's execution state for a
+	// minimal identity (id, phase, timestamps).
+	RunStore store.Store
 
 	// Audit is the governance audit log backing
 	// GET /v1/runs/{id}/audit. Optional — when nil the endpoint
@@ -395,6 +401,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/runs/{id}", s.requireCapability(rbac.CapRunRead, s.handleGetRun))
 	s.mux.HandleFunc("GET /v1/runs/{id}/events", s.requireCapability(rbac.CapRunRead, s.handleRunEventsSSE))
 	s.mux.HandleFunc("GET /v1/runs/{id}/audit", s.requireCapability(rbac.CapAuditRead, s.handleListRunAudit))
+	s.mux.HandleFunc("GET /v1/runs/{id}/compliance",
+		s.requireCapability(rbac.CapAuditRead, s.handleRunCompliance))
 	s.mux.HandleFunc("DELETE /v1/runs/{id}", s.requireCapability(rbac.CapRunCancel, s.handleCancelRun))
 	s.mux.HandleFunc("POST /v1/approvals/{id}", s.requireCapability(rbac.CapApprove, s.handleApproveRun))
 }
