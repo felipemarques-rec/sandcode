@@ -68,6 +68,7 @@ const (
 const (
 	ClassifyRequested  Type = "classify.requested"
 	ArchitectRequested Type = "architect.requested"
+	StepBackRequested  Type = "stepback.requested"
 	PlanRequested      Type = "plan.requested"
 	StrategyRequested  Type = "strategy.requested"
 	EnrichRequested    Type = "enrich.requested"
@@ -107,6 +108,10 @@ const (
 	// RunArchitected is emitted (observation-only) after an Architect designs
 	// solution guidance for a run. It never changes run status or phase.
 	RunArchitected Type = "run.architected"
+
+	// RunSteppedBack is emitted (observation-only) after the Step-Back Reasoner
+	// distills reframing principles. Not part of the transition table.
+	RunSteppedBack Type = "run.stepped_back"
 
 	// SecurityReviewed is emitted (observation-only) after a Security Reviewer
 	// scans a run's diff. It never changes run status.

@@ -22,6 +22,7 @@ import (
 	sclog "github.com/felipemarques-rec/sandcode/internal/log"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
 	"github.com/felipemarques-rec/sandcode/internal/reactor"
+	"github.com/felipemarques-rec/sandcode/internal/stepback"
 	"github.com/felipemarques-rec/sandcode/internal/strategy"
 )
 
@@ -59,6 +60,14 @@ func WithArchitect(a architect.Architect) Option {
 	return func(k *Kernel) { k.architect = a }
 }
 
+// WithStepBack wires the Step-Back Reasoner. When nil (default) the step-back
+// stage is skipped entirely and the working prompt is unchanged (byte-identical).
+// Gated on divergent OR high; failures degrade gracefully. Runs after the
+// Architect stage so both guidances stack.
+func WithStepBack(s stepback.StepBack) Option {
+	return func(k *Kernel) { k.stepback = s }
+}
+
 // WithSelector wires a strategy selector that picks the execution
 // shape (single/refine/parallel) from classification + plan. When nil,
 // the strategy step is skipped and ProcessResult.Strategy is empty —
@@ -84,6 +93,7 @@ type Kernel struct {
 	enricher   *brain.Enricher
 	planner    planner.Planner
 	architect  architect.Architect
+	stepback   stepback.StepBack
 	selector   strategy.Selector
 	bus        event.Bus
 	tracer     Tracer
@@ -198,6 +208,37 @@ func (k *Kernel) Process(ctx context.Context, req ProcessRequest) ProcessResult 
 					FilesCount:  len(ap.Files),
 					RisksCount:  len(ap.Risks),
 					Architect:   ap.Architect,
+				})}
+			})
+	}
+
+	// 1.6 Step-Back (gated on divergent OR high). Distills reframing principles
+	// prepended to the working prompt feeding plan + enrich. Runs AFTER architect
+	// so both guidances stack (architect reassigns workingPrompt from req.Prompt).
+	if k.stepback != nil &&
+		(classification.Type == brain.Divergent || classification.Complexity == brain.ComplexityHigh) {
+		k.stage(ctx, req.RunID, event.StepBackRequested,
+			stepBackRequestedPayload{Complexity: string(classification.Complexity), ProblemType: string(classification.Type)},
+			func(wctx context.Context) []event.Event {
+				sctx, end := k.tracer.Start(wctx, "kernel.stepback", nil)
+				res, err := k.stepback.Reason(sctx, stepback.ReasonRequest{
+					Prompt:      req.Prompt,
+					ProblemType: string(classification.Type),
+					Complexity:  string(classification.Complexity),
+				})
+				end(err)
+				if err != nil || len(res.Principles) == 0 {
+					if err != nil {
+						logger.Warn("step-back failed, proceeding without principles", "error", err)
+					}
+					return nil
+				}
+				workingPrompt = formatStepBackGuidance(res) + workingPrompt
+				logger.Info("stepped back", "principles", len(res.Principles))
+				return []event.Event{k.buildEvent(wctx, event.RunSteppedBack, req.RunID, steppedBackPayload{
+					RunID:          req.RunID,
+					PrincipleCount: len(res.Principles),
+					Reasoner:       res.Reasoner,
 				})}
 			})
 	}
@@ -390,6 +431,11 @@ type architectRequestedPayload struct {
 	ProblemType string `json:"problem_type"`
 }
 
+type stepBackRequestedPayload struct {
+	Complexity  string `json:"complexity"`
+	ProblemType string `json:"problem_type"`
+}
+
 type planRequestedPayload struct {
 	PromptLen int `json:"prompt_len"`
 }
@@ -438,6 +484,14 @@ type architectedPayload struct {
 	Architect   string `json:"architect"`
 }
 
+// steppedBackPayload is the JSON shape of run.stepped_back events. Carries only
+// structural metadata — the principles themselves are folded into the working prompt.
+type steppedBackPayload struct {
+	RunID          string `json:"run_id"`
+	PrincipleCount int    `json:"principle_count"`
+	Reasoner       string `json:"reasoner"`
+}
+
 // strategyPayload is the JSON shape of run.strategy_selected events.
 type strategyPayload struct {
 	Strategy string `json:"strategy"`
@@ -473,6 +527,20 @@ func formatArchGuidance(ap architect.ArchPlan) string {
 		b.WriteString("\n")
 	}
 	b.WriteString("---\n\n")
+	return b.String()
+}
+
+// formatStepBackGuidance renders step-back principles as a compact Markdown block
+// prepended to the working prompt. Deterministic.
+func formatStepBackGuidance(res stepback.Result) string {
+	var b strings.Builder
+	b.WriteString("## Step-back principles\n\n")
+	for _, p := range res.Principles {
+		b.WriteString("- ")
+		b.WriteString(p)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n---\n\n")
 	return b.String()
 }
 
