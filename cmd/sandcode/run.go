@@ -17,6 +17,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/auth"
 	"github.com/felipemarques-rec/sandcode/internal/brain"
 	"github.com/felipemarques-rec/sandcode/internal/budget"
+	"github.com/felipemarques-rec/sandcode/internal/costopt"
 	"github.com/felipemarques-rec/sandcode/internal/event"
 	gitm "github.com/felipemarques-rec/sandcode/internal/git"
 	"github.com/felipemarques-rec/sandcode/internal/governance"
@@ -60,6 +61,7 @@ type runFlags struct {
 	stepBack     bool
 	planStage    bool // --plan: wire kernel planner (decompose high-complexity prompts)
 	strategySel  bool // --strategy-select: wire kernel selector (pick single/refine/parallel)
+	costOptimize bool // --cost-optimize: kernel routes the agent model by complexity
 	reactive     bool // --reactive: route classify through the deterministic reactor (SP3.0)
 	roles        []string
 	mcp          []string // --mcp: MCP servers to enable (e.g. context7)
@@ -371,6 +373,9 @@ func newRunCmd() *cobra.Command {
 			if f.reactive && !f.learn {
 				return errors.New("--reactive requires --learn (kernel path)")
 			}
+			if f.costOptimize && !f.learn {
+				return errors.New("--cost-optimize requires --learn (kernel path)")
+			}
 
 			cwd := f.cwd
 			if cwd == "" {
@@ -521,6 +526,9 @@ func newRunCmd() *cobra.Command {
 				// nil selector ⇒ empty Strategy ⇒ Execute defaults to single.
 				if f.strategySel {
 					kopts = append(kopts, kernel.WithSelector(strat.New()))
+				}
+				if f.costOptimize {
+					kopts = append(kopts, kernel.WithModelRouter(costopt.New()))
 				}
 				// Wire the deterministic reactor for the classify stage (SP3.0
 				// PoC). Needs the bus (already wired above). Off ⇒ direct path.
@@ -811,6 +819,8 @@ func newRunCmd() *cobra.Command {
 		"kernel decomposes high-complexity prompts into a TaskDAG (needs ANTHROPIC_API_KEY; requires --learn)")
 	cmd.Flags().BoolVar(&f.strategySel, "strategy-select", false,
 		"kernel picks execution shape single/refine/parallel from classification+plan (requires --learn)")
+	cmd.Flags().BoolVar(&f.costOptimize, "cost-optimize", false,
+		"route the agent model by task complexity (kernel-stage; requires --learn)")
 	cmd.Flags().BoolVar(&f.reactive, "reactive", false,
 		"drive the run through the deterministic reactor (SP3 bus-mediation): cognitive pipeline (classify→enrich) and the execute/verify/lint/refine cycle. Byte-identical results; requires --learn")
 	cmd.Flags().BoolVar(&f.dag, "dag", false, "execute as multi-node DAG plan; forces planner LLM if Plan empty after kernel. Cost scales as outerN × chains × nodes × refineMaxAttempts; use --max-cost-usd to cap.")
