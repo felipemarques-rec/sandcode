@@ -241,6 +241,16 @@ func isFallback(reason string) bool {
 // forwarded options carry the EnrichedPrompt and Kernel=nil so the
 // destination (Run/ParallelRun/DAGRun) does NOT re-invoke the kernel.
 // TestExecute_KernelProcessOnlyCalledOnce is the regression gate.
+// applyRoutedModel overrides the agent model with the Cost Optimizer's choice when
+// the kernel routed one (E3.2). Empty routed model ⇒ AgentOpts unchanged
+// (byte-identical). The router wins over an explicit --model by design.
+func applyRoutedModel(ao agent.RunOptions, routed string) agent.RunOptions {
+	if routed != "" {
+		ao.Model = routed
+	}
+	return ao
+}
+
 func Execute(
 	ctx context.Context,
 	sb sandbox.Provider,
@@ -281,6 +291,8 @@ func Execute(
 			CWD:    opts.CWD,
 			RunID:  opts.RunID,
 		})
+
+		opts.AgentOpts = applyRoutedModel(opts.AgentOpts, pr.Model)
 
 		resolvedPlan := pr.Plan
 		if pr.Strategy == strategy.StrategyParallel && len(resolvedPlan.Nodes) == 0 {
