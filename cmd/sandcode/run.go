@@ -499,11 +499,11 @@ func newRunCmd() *cobra.Command {
 					kopts = append(kopts, kernel.WithArchitect(arch))
 				}
 				if f.stepBack {
-					sb, serr := newStepBack(f)
+					sbr, serr := newStepBack(f)
 					if serr != nil {
 						return serr
 					}
-					kopts = append(kopts, kernel.WithStepBack(sb))
+					kopts = append(kopts, kernel.WithStepBack(sbr))
 				}
 				// Wire the kernel planner when the user opts into the Plan
 				// stage (--plan) or the DAG path (--dag relies on
