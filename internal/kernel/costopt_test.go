@@ -9,13 +9,12 @@ import (
 )
 
 // TestProcess_ModelRouted asserts the router sets ProcessResult.Model and emits
-// the observation-only events.
+// the observation-only result event on the direct path.
 func TestProcess_ModelRouted(t *testing.T) {
 	const prompt = "design the distributed architecture migration across services" // divergent/high → strong
 	bus := event.NewLocalBus()
 	t.Cleanup(func() { _ = bus.Close() })
 	rec := newRecorder()
-	bus.Subscribe(event.ModelRouteRequested, rec.handler())
 	bus.Subscribe(event.RunModelRouted, rec.handler())
 
 	res := New(openTestBrain(t), WithBus(bus), WithModelRouter(costopt.New())).
@@ -24,7 +23,6 @@ func TestProcess_ModelRouted(t *testing.T) {
 	if res.Model != costopt.ModelStrong {
 		t.Fatalf("Model = %q, want %q", res.Model, costopt.ModelStrong)
 	}
-	rec.requireType(t, event.ModelRouteRequested)
 	rec.requireType(t, event.RunModelRouted)
 }
 

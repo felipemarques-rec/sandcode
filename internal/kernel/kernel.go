@@ -301,13 +301,6 @@ func (k *Kernel) Process(ctx context.Context, req ProcessRequest) ProcessResult 
 	// via ProcessResult.Model.
 	var routedModel string
 	if k.router != nil {
-		// In direct mode the stage helper only publishes result events; emit the
-		// observation-only command explicitly so bus subscribers see it on both
-		// paths (the reactive stage already publishes it via Dispatch).
-		if !k.reactive {
-			k.publish(ctx, event.ModelRouteRequested, req.RunID,
-				modelRouteRequestedPayload{Complexity: string(classification.Complexity), ProblemType: string(classification.Type)})
-		}
 		k.stage(ctx, req.RunID, event.ModelRouteRequested,
 			modelRouteRequestedPayload{Complexity: string(classification.Complexity), ProblemType: string(classification.Type)},
 			func(wctx context.Context) []event.Event {
