@@ -28,6 +28,7 @@ import (
 	"github.com/felipemarques-rec/sandcode/internal/planner"
 	"github.com/felipemarques-rec/sandcode/internal/sandbox"
 	"github.com/felipemarques-rec/sandcode/internal/secreview"
+	"github.com/felipemarques-rec/sandcode/internal/stepback"
 	"github.com/felipemarques-rec/sandcode/internal/store"
 	strat "github.com/felipemarques-rec/sandcode/internal/strategy"
 	"github.com/spf13/cobra"
@@ -56,6 +57,7 @@ type runFlags struct {
 	llmAuth      string
 	learn        bool
 	architect    bool
+	stepBack     bool
 	planStage    bool // --plan: wire kernel planner (decompose high-complexity prompts)
 	strategySel  bool // --strategy-select: wire kernel selector (pick single/refine/parallel)
 	reactive     bool // --reactive: route classify through the deterministic reactor (SP3.0)
@@ -322,6 +324,17 @@ func newArchitect(f runFlags) (architect.Architect, error) {
 	return architect.NewLLMArchitectFromEnv(f.judgeModel)
 }
 
+func newStepBack(f runFlags) (stepback.StepBack, error) {
+	mode, err := resolveLLMAuth(f.llmAuth)
+	if err != nil {
+		return nil, err
+	}
+	if mode == llmAuthSubscription {
+		return stepback.NewLLMStepBackFromSubscription(f.judgeModel), nil
+	}
+	return stepback.NewLLMStepBackFromEnv(f.judgeModel)
+}
+
 func newPlanner(f runFlags) (planner.Planner, error) {
 	mode, err := resolveLLMAuth(f.llmAuth)
 	if err != nil {
@@ -345,6 +358,9 @@ func newRunCmd() *cobra.Command {
 
 			if f.architect && !f.learn {
 				return errors.New("--architect requires --learn (kernel path)")
+			}
+			if f.stepBack && !f.learn {
+				return errors.New("--step-back requires --learn (kernel path)")
 			}
 			if f.planStage && !f.learn {
 				return errors.New("--plan requires --learn (kernel path)")
@@ -481,6 +497,13 @@ func newRunCmd() *cobra.Command {
 						return aerr
 					}
 					kopts = append(kopts, kernel.WithArchitect(arch))
+				}
+				if f.stepBack {
+					sb, serr := newStepBack(f)
+					if serr != nil {
+						return serr
+					}
+					kopts = append(kopts, kernel.WithStepBack(sb))
 				}
 				// Wire the kernel planner when the user opts into the Plan
 				// stage (--plan) or the DAG path (--dag relies on
@@ -782,6 +805,8 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.learn, "learn", false, "enable cognitive learning: enrich prompts with past lessons and learn from outcomes")
 	cmd.Flags().BoolVar(&f.architect, "architect", false,
 		"design solution guidance before the run (kernel-stage; needs ANTHROPIC_API_KEY; requires --learn)")
+	cmd.Flags().BoolVar(&f.stepBack, "step-back", false,
+		"distill high-level reframing principles before the run (kernel-stage; needs ANTHROPIC_API_KEY; requires --learn)")
 	cmd.Flags().BoolVar(&f.planStage, "plan", false,
 		"kernel decomposes high-complexity prompts into a TaskDAG (needs ANTHROPIC_API_KEY; requires --learn)")
 	cmd.Flags().BoolVar(&f.strategySel, "strategy-select", false,

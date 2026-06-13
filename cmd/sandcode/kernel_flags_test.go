@@ -10,7 +10,7 @@ import (
 // default to false (off ⇒ byte-identical legacy kernel path).
 func TestKernelFlags_Registered(t *testing.T) {
 	cmd := newRunCmd()
-	for _, name := range []string{"plan", "strategy-select", "reactive"} {
+	for _, name := range []string{"plan", "strategy-select", "reactive", "step-back"} {
 		fl := cmd.Flags().Lookup(name)
 		if fl == nil {
 			t.Fatalf("flag --%s not registered", name)
@@ -33,6 +33,7 @@ func TestKernelFlags_RequireLearn(t *testing.T) {
 		{"plan without learn", []string{"--plan", "do a thing"}, "--plan requires --learn"},
 		{"strategy-select without learn", []string{"--strategy-select", "do a thing"}, "--strategy-select requires --learn"},
 		{"reactive without learn", []string{"--reactive", "do a thing"}, "--reactive requires --learn"},
+		{"step-back without learn", []string{"--step-back", "do a thing"}, "--step-back requires --learn"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
