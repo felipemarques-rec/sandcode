@@ -66,12 +66,13 @@ const (
 // request work from a reactor handler that publishes the corresponding result
 // event (e.g. classify.requested → run.classified). They never transition phase.
 const (
-	ClassifyRequested  Type = "classify.requested"
-	ArchitectRequested Type = "architect.requested"
-	StepBackRequested  Type = "stepback.requested"
-	PlanRequested      Type = "plan.requested"
-	StrategyRequested  Type = "strategy.requested"
-	EnrichRequested    Type = "enrich.requested"
+	ClassifyRequested   Type = "classify.requested"
+	ArchitectRequested  Type = "architect.requested"
+	StepBackRequested   Type = "stepback.requested"
+	PlanRequested       Type = "plan.requested"
+	StrategyRequested   Type = "strategy.requested"
+	ModelRouteRequested Type = "modelroute.requested"
+	EnrichRequested     Type = "enrich.requested"
 
 	// Refine-cycle commands (SP3.2) sequence the reactive execute/verify/lint
 	// cycle. Observation-only — the result events (agent.*/verify.*/lint.*/
@@ -112,6 +113,10 @@ const (
 	// RunSteppedBack is emitted (observation-only) after the Step-Back Reasoner
 	// distills reframing principles. Not part of the transition table.
 	RunSteppedBack Type = "run.stepped_back"
+
+	// RunModelRouted is emitted (observation-only) after the Cost Optimizer routes
+	// the agent model from the classification. Not part of the transition table.
+	RunModelRouted Type = "run.model_routed"
 
 	// SecurityReviewed is emitted (observation-only) after a Security Reviewer
 	// scans a run's diff. It never changes run status.

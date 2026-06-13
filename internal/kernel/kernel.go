@@ -18,6 +18,7 @@ import (
 
 	"github.com/felipemarques-rec/sandcode/internal/architect"
 	"github.com/felipemarques-rec/sandcode/internal/brain"
+	"github.com/felipemarques-rec/sandcode/internal/costopt"
 	"github.com/felipemarques-rec/sandcode/internal/event"
 	sclog "github.com/felipemarques-rec/sandcode/internal/log"
 	"github.com/felipemarques-rec/sandcode/internal/planner"
@@ -76,6 +77,14 @@ func WithSelector(s strategy.Selector) Option {
 	return func(k *Kernel) { k.selector = s }
 }
 
+// WithModelRouter wires the Cost Optimizer's deterministic model router. When nil
+// (default) the model-route stage is skipped and ProcessResult.Model is empty
+// (byte-identical). Runs after strategy-select; observation-only — the routed model
+// is applied by the orchestrator.
+func WithModelRouter(r costopt.Router) Option {
+	return func(k *Kernel) { k.router = r }
+}
+
 // WithReactive routes the classify stage through the deterministic reactor
 // (SP3.0) instead of calling the classifier directly — the proof-of-concept
 // for bus-mediated, event-driven coordination. Requires a Bus (WithBus); with
@@ -95,6 +104,7 @@ type Kernel struct {
 	architect  architect.Architect
 	stepback   stepback.StepBack
 	selector   strategy.Selector
+	router     costopt.Router
 	bus        event.Bus
 	tracer     Tracer
 	logger     *slog.Logger
@@ -147,6 +157,11 @@ type ProcessResult struct {
 	// configured. Reason is the human-readable rule that fired.
 	Strategy       strategy.Strategy
 	StrategyReason string
+
+	// Model is the agent model chosen by the Cost Optimizer (E3.2) from the
+	// classification. Empty when no router is configured — the orchestrator then
+	// leaves AgentOpts.Model unchanged (byte-identical).
+	Model string
 }
 
 // Process runs the cognitive pipeline: classify → architect → plan → strategy
@@ -281,6 +296,32 @@ func (k *Kernel) Process(ctx context.Context, req ProcessRequest) ProcessResult 
 			})
 	}
 
+	// 3.5 Model route (Cost Optimizer; when a router is wired). Picks the agent
+	// model from the classification. Observation-only — applied by the orchestrator
+	// via ProcessResult.Model.
+	var routedModel string
+	if k.router != nil {
+		// In direct mode the stage helper only publishes result events; emit the
+		// observation-only command explicitly so bus subscribers see it on both
+		// paths (the reactive stage already publishes it via Dispatch).
+		if !k.reactive {
+			k.publish(ctx, event.ModelRouteRequested, req.RunID,
+				modelRouteRequestedPayload{Complexity: string(classification.Complexity), ProblemType: string(classification.Type)})
+		}
+		k.stage(ctx, req.RunID, event.ModelRouteRequested,
+			modelRouteRequestedPayload{Complexity: string(classification.Complexity), ProblemType: string(classification.Type)},
+			func(wctx context.Context) []event.Event {
+				_, end := k.tracer.Start(wctx, "kernel.modelroute", nil)
+				model, reason := k.router.Route(classification)
+				end(nil)
+				routedModel = model
+				logger.Info("model routed", "model", model, "reason", reason)
+				return []event.Event{k.buildEvent(wctx, event.RunModelRouted, req.RunID, modelRoutedPayload{
+					Model: model, Reason: reason,
+				})}
+			})
+	}
+
 	// 4. Enrich (recall + Grill with Docs; when an enricher is wired). Recall
 	// emits brain.lesson_recalled (observation-only, published directly so it
 	// precedes enrich exactly as the legacy path does) before run.enriched.
@@ -324,6 +365,7 @@ func (k *Kernel) Process(ctx context.Context, req ProcessRequest) ProcessResult 
 		Arch:           arch,
 		Strategy:       chosen,
 		StrategyReason: reason,
+		Model:          routedModel,
 	}
 }
 
@@ -441,6 +483,17 @@ type planRequestedPayload struct {
 }
 
 type strategyRequestedPayload struct{}
+
+type modelRouteRequestedPayload struct {
+	Complexity  string `json:"complexity"`
+	ProblemType string `json:"problem_type"`
+}
+
+// modelRoutedPayload is the JSON shape of run.model_routed events.
+type modelRoutedPayload struct {
+	Model  string `json:"model"`
+	Reason string `json:"reason"`
+}
 
 type enrichRequestedPayload struct {
 	PromptLen int `json:"prompt_len"`
